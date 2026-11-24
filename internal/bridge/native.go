@@ -49,50 +49,49 @@ type FallbackResolver interface {
 }
 
 type nativeRequest struct {
-	audioInput                            []byte
-	audioInputDone                        bool
-	inputWhisper                          bool
-	streaming                             bool
-	listenOnStreamStart                   bool
-	partial                               uint32
-	responseID                            string
-	final                                 bool
-	aggregateSeen                         bool
-	aggregateFinalSeen                    bool
-	header                                *header.TEventHeader
-	isText                                bool
-	ttsStarted                            bool
-	gated                                 bool
-	input                                 []byte
-	id                                    string
-	request                               *request.TAliceRequestProto
-	text                                  string
-	route                                 string
-	ctx                                   context.Context
-	cancel                                context.CancelFunc
-	started, canceled, local, cloud       bool
-	outputPending                         bool
-	cloudFrames                           []cloudFrame
-	cloudBytes                            int
-	continuation                          []byte
-	ttsID                                 string
-	progressTTS                           string
-	markedTTS                             bool // <speaker> can produce chained Opus streams.
-	audio                                 oggSpeech
-	audioIsProgress                       bool
-	audioStarted                          bool
-	audioStream                           uint32
-	audioWaiting                          bool
-	progressAudioDone                     chan struct{}
-	probePrefix                           string          // Nonempty when the first deferred segment is actual speech.
-	probeSuffix                           strings.Builder // Written by the phrase worker; read after it is joined.
-	probePart, audioGap                   int
-	probeStart                            time.Time
-	probeSeek, probeRaw, probeAudioLogged bool // protected by Native.mu
-	soundRequest                          *sound.Request
-	soundDirective                        *soundDirective
-	soundSealed                           bool
-	expires                               *time.Timer
+	audioInput                      []byte
+	audioInputDone                  bool
+	inputWhisper                    bool
+	streaming                       bool
+	listenOnStreamStart             bool
+	partial                         uint32
+	responseID                      string
+	final                           bool
+	aggregateSeen                   bool
+	aggregateFinalSeen              bool
+	header                          *header.TEventHeader
+	isText                          bool
+	ttsStarted                      bool
+	gated                           bool
+	input                           []byte
+	id                              string
+	request                         *request.TAliceRequestProto
+	text                            string
+	route                           string
+	ctx                             context.Context
+	cancel                          context.CancelFunc
+	started, canceled, local, cloud bool
+	outputPending                   bool
+	cloudFrames                     []cloudFrame
+	cloudBytes                      int
+	continuation                    []byte
+	ttsID                           string
+	progressTTS                     string
+	markedTTS                       bool // <speaker> can produce chained Opus streams.
+	audio                           oggSpeech
+	audioIsProgress                 bool
+	audioStarted                    bool
+	audioStream                     uint32
+	audioWaiting                    bool
+	progressAudioDone               chan struct{}
+	probePrefix                     string          // Nonempty when the first deferred segment is actual speech.
+	probeSuffix                     strings.Builder // Written by the phrase worker; read after it is joined.
+	audioGap                        int
+	probeSeek, probeRaw             bool // protected by Native.mu
+	soundRequest                    *sound.Request
+	soundDirective                  *soundDirective
+	soundSealed                     bool
+	expires                         *time.Timer
 }
 type Native struct {
 	connectionScope  string
@@ -234,7 +233,7 @@ func (n *Native) Client(ctx context.Context, k websocket.MessageType, data []byt
 			delete(n.requests, p.id)
 			delete(n.tts, p.ttsID)
 			delete(n.tts, p.progressTTS)
-			if p.probePart > 1 {
+			if p.probePrefix != "" {
 				for id, owner := range n.tts {
 					if owner == p {
 						delete(n.tts, id)
@@ -352,18 +351,10 @@ func (n *Native) server(ctx context.Context, k websocket.MessageType, data []byt
 				}
 			}
 			n.mu.Lock()
-			p := n.streams[binary.BigEndian.Uint32(data)]
-			drop := n.blocked[binary.BigEndian.Uint32(data)] != nil || (p != nil && p.canceled)
+			p := n.streams[sid]
+			drop := n.blocked[sid] != nil || (p != nil && p.canceled)
 			if p != nil && (p.streaming || p.markedTTS) && !drop {
 				out, err := p.audio.feed(data[4:])
-				if err == nil && p.probePrefix != "" && !p.probeAudioLogged && p.audio.source.headers >= 3 {
-					p.probeAudioLogged = true
-					event := "chatgpt_probe_first_audio_rx"
-					if p.probePart > 1 {
-						event = "chatgpt_probe_phrase_audio_rx"
-					}
-					slog.Info(event, "request", requestTag(p.id), "part", p.probePart, "ms", time.Since(p.probeStart).Milliseconds(), "raw", p.probeRaw)
-				}
 				rawEOS := p.probeRaw && p.audio.source.ended && len(p.audio.source.buffer) == 0
 				if err == nil && len(out) > 0 {
 					err = n.down(ctx, k, append(binary.BigEndian.AppendUint32(nil, p.audioStream), out...))
@@ -691,18 +682,11 @@ func (n *Native) maybeResolve(p *nativeRequest) {
 				stop := func() {}
 				resolveCtx := p.ctx
 				if decision.Source == "chatgpt_voice_probe" {
-					p.probeStart = time.Now()
-					mode := os.Getenv("QUASAR_CHATGPT_VOICE_PROBE")
-					if mode == "early" || mode == "phrases" {
-						resolveCtx, stop = n.probeContext(p, mode == "phrases")
-					}
+					resolveCtx, stop = n.probeContext(p)
 				} else if decision.Route != "yandex" && n.ProgressAfter > 0 {
 					stop = n.progress(p)
 				}
 				result, err = routed.ResolveDecision(resolveCtx, text, decision)
-				if decision.Source == "chatgpt_voice_probe" {
-					slog.Info("chatgpt_probe_complete", "request", requestTag(p.id), "ms", time.Since(p.probeStart).Milliseconds(), "success", err == nil)
-				}
 				stop()
 			} else {
 				result, err = n.resolver.Resolve(p.ctx, text)

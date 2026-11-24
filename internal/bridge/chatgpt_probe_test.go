@@ -33,30 +33,22 @@ func TestChatGPTProbeAudioBeforeCompletion(t *testing.T) {
 		name    string
 		raw     bool
 		tail    string
-		mode    string
 		backlog bool
 	}{
-		{"envelopes", false, " Вторая фраза.", "early", false},
-		{"raw-reused-id", true, " Вторая фраза.", "early", false},
-		{"raw-no-tail", true, "", "early", false},
-		{"phrases", false, " И конец", "phrases", false},
-		{"phrases-raw-no-tail", true, "", "phrases", false},
-		{"completed-with-backlog", false, " И конец", "phrases", true},
+		{"envelopes", false, " И конец", false},
+		{"raw-reused-id-no-tail", true, "", false},
+		{"completed-with-backlog", false, " И конец", true},
 	} {
-		t.Run(tc.name, func(t *testing.T) { testChatGPTProbe(t, tc.raw, tc.tail, tc.mode, tc.backlog) })
+		t.Run(tc.name, func(t *testing.T) { testChatGPTProbe(t, tc.raw, tc.tail, tc.backlog) })
 	}
 }
-func testChatGPTProbe(t *testing.T, raw bool, tail, mode string, backlog bool) {
-	t.Setenv("QUASAR_CHATGPT_VOICE_PROBE", mode)
+func testChatGPTProbe(t *testing.T, raw bool, tail string, backlog bool) {
+	t.Setenv("QUASAR_CHATGPT_VOICE_PROBE", "phrases")
 	release := make(chan struct{})
 	unblock := sync.OnceFunc(func() { close(release) })
 	const first = "Первая фраза."
 	const second, third = " Вторая фраза!", " Третья фраза?"
-	answer := first
-	if mode == "phrases" {
-		answer += second + third
-	}
-	answer += tail
+	answer := first + second + third + tail
 	lc := &llm.Client{API: "chatgpt", Model: "fixture", HostedTools: []string{"web_search"}, AccessToken: func(context.Context) (string, error) { return "fixture", nil }}
 	lc.HTTP = &http.Client{Transport: probeTransport(func(req *http.Request) (*http.Response, error) {
 		var body map[string]any
@@ -70,9 +62,7 @@ func testChatGPTProbe(t *testing.T, raw bool, tail, mode string, backlog bool) {
 			io.WriteString(w, "data: {\"type\":\"response.output_item.added\",\"output_index\":1,\"item\":{\"id\":\"m1\",\"type\":\"message\",\"role\":\"assistant\",\"phase\":\"final_answer\"}}\n\n")
 			io.WriteString(w, "data: {\"type\":\"response.output_text.delta\",\"item_id\":\"m1\",\"output_index\":1,\"content_index\":0,\"delta\":\"Первая фра\"}\n\n")
 			io.WriteString(w, "data: {\"type\":\"response.output_text.delta\",\"item_id\":\"m1\",\"output_index\":1,\"content_index\":0,\"delta\":\"за.\"}\n\n")
-			if mode == "phrases" {
-				io.WriteString(w, "data: {\"type\":\"response.output_text.delta\",\"item_id\":\"m1\",\"output_index\":1,\"content_index\":0,\"delta\":\""+second+third+"\"}\n\n")
-			}
+			io.WriteString(w, "data: {\"type\":\"response.output_text.delta\",\"item_id\":\"m1\",\"output_index\":1,\"content_index\":0,\"delta\":\""+second+third+"\"}\n\n")
 			select {
 			case <-req.Context().Done():
 				return
@@ -146,7 +136,7 @@ func testChatGPTProbe(t *testing.T, raw bool, tail, mode string, backlog bool) {
 	}
 	feed(firstID, 71, packet)
 	earlyPackets := [][]byte{packet}
-	if mode == "phrases" && !backlog {
+	if !backlog {
 		for i, part := range []string{second, third} {
 			marker := []byte{0xf8, 0x12, 0x34, byte(i + 1)}
 			feed(nextTTS(part), uint32(73+i), marker)
@@ -258,12 +248,14 @@ func TestProbeActivationIsExplicit(t *testing.T) {
 		mode, api, query string
 		want             bool
 	}{
-		{"early", "chatgpt", "Алиса, тест потока, расскажи сказку", true},
-		{"baseline", "chatgpt", "Тест потока: расскажи сказку", true},
-		{"early", "chatgpt", "расскажи сказку", false},
+		{"phrases", "chatgpt", "Алиса, тест потока, расскажи сказку", true},
+		{"phrases", "chatgpt", "Тест потока: расскажи сказку", true},
+		{"phrases", "chatgpt", "расскажи сказку", false},
+		{"early", "chatgpt", "тест потока расскажи сказку", false},
+		{"baseline", "chatgpt", "тест потока расскажи сказку", false},
 		{"", "chatgpt", "тест потока расскажи сказку", false},
-		{"early", "responses", "тест потока расскажи сказку", false},
-		{"early", "chatgpt", "тест потоками", false},
+		{"phrases", "responses", "тест потока расскажи сказку", false},
+		{"phrases", "chatgpt", "тест потоками", false},
 	} {
 		t.Setenv("QUASAR_CHATGPT_VOICE_PROBE", tc.mode)
 		e := Engine{LLM: &llm.Client{API: tc.api}}
