@@ -103,6 +103,12 @@ func (n *Native) beginDeferred(p *nativeRequest) error {
 	if err := n.down(p.ctx, websocket.MessageBinary, b); err != nil {
 		return err
 	}
+	if p.probePrefix != "" {
+		if err := n.deferredPart(p, p.probePrefix, p.probePrefix, false); err != nil {
+			return err
+		}
+		return n.synthesize(p, p.probePrefix)
+	}
 	if err := n.deferredPart(p, "", "", false); err != nil {
 		return err
 	}
@@ -175,12 +181,16 @@ func (n *Native) finishSilentAudio(p *nativeRequest) error {
 	if err := n.down(p.ctx, websocket.MessageBinary, append(binary.BigEndian.AppendUint32(nil, streamID), end...)); err != nil {
 		return err
 	}
-	m := &server.TServerMessage{Message: &server.TServerMessage_StreamControl{StreamControl: &stream.TStreamControl{MessageId: p.id, StreamId: int64(streamID), Action: &stream.TStreamControl_Close{Close: &stream.TStreamControl_TActionClose{}}}}}
-	b, err := (wire.Frame{Server: m, Prefix: []byte("AAPI")}).Marshal()
+	b, err := speechCloseFrame(p.id, streamID)
 	if err != nil {
 		return err
 	}
 	return n.down(p.ctx, websocket.MessageBinary, b)
+}
+
+func speechCloseFrame(id string, streamID uint32) ([]byte, error) {
+	m := &server.TServerMessage{Message: &server.TServerMessage_StreamControl{StreamControl: &stream.TStreamControl{MessageId: id, StreamId: int64(streamID), Action: &stream.TStreamControl_Close{Close: &stream.TStreamControl_TActionClose{}}}}}
+	return (wire.Frame{Server: m, Prefix: []byte("AAPI")}).Marshal()
 }
 
 // Called under n.mu after the first synthesized segment closes. Keep the audio

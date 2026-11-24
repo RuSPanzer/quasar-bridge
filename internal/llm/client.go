@@ -265,7 +265,8 @@ func (c *Client) post(ctx context.Context, path string, request any) ([]byte, er
 		return nil, llmHTTPError(resp)
 	}
 	if c.API == "chatgpt" {
-		data, err := readResponseStream(resp.Body)
+		emit, _ := ctx.Value(textPreviewKey{}).(func(string) error)
+		data, err := readResponseStreamPreview(resp.Body, emit)
 		if err != nil && ctx.Err() != nil {
 			return nil, fmt.Errorf("LLM transport: %w", ctx.Err())
 		}

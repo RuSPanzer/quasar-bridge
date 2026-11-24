@@ -1,0 +1,181 @@
+package bridge
+
+import (
+	"context"
+	"errors"
+	"log/slog"
+	"os"
+	"strings"
+	"time"
+	"unicode"
+	"unicode/utf8"
+
+	"github.com/coder/websocket"
+	"github.com/skrashevich/quasar-bridge/internal/llm"
+	"github.com/skrashevich/quasar-bridge/internal/reply"
+	"github.com/skrashevich/quasar-bridge/internal/wire"
+	header "github.com/skrashevich/quasar-go-genproto/proto/alice/protos/api/alicekit/events/common/event_header"
+	tts "github.com/skrashevich/quasar-go-genproto/proto/alice/protos/api/alicekit/events/tts_speak"
+	server "github.com/skrashevich/quasar-go-genproto/proto/alice/protos/api/alicekit/protocol/server"
+)
+
+type probeTurnKey struct{}
+
+// Some UniProxy versions send a raw Opus BOS instead of TtsSpeak. Only
+// bind an unowned stream while one explicit probe is awaiting synthesis.
+// Called under serverMu; use the regular correlated envelope/close handling.
+func (n *Native) bindProbeRaw(ctx context.Context, k websocket.MessageType, sid uint32) error {
+	n.mu.Lock()
+	delete(n.probeEnded, sid)
+	var owner *nativeRequest
+	if n.streams[sid] == nil && n.cloudStreams[sid] == nil && n.blocked[sid] == nil {
+		for _, p := range n.requests {
+			if !p.probeSeek {
+				continue
+			}
+			if owner != nil {
+				n.mu.Unlock()
+				return errors.New("ambiguous raw probe synthesis")
+			}
+			owner = p
+		}
+	}
+	if owner == nil {
+		n.mu.Unlock()
+		return nil
+	}
+	if owner.canceled || owner.ctx.Err() != nil {
+		n.blocked[sid] = owner
+		owner.probeSeek = false
+		n.mu.Unlock()
+		return nil
+	}
+	owner.probeRaw = true
+	id := owner.ttsID
+	n.mu.Unlock()
+	m := &server.TServerMessage{Message: &server.TServerMessage_Event{Event: &server.TServerMessage_TEvent{Header: &header.TEventHeader{MessageId: newID(), RefMessageId: id, StreamId: new(int64(sid))}, Event: &server.TServerMessage_TEvent_TtsSpeak{TtsSpeak: &tts.TTtsSpeak{Format: "audio/opus"}}}}}
+	b, err := (wire.Frame{Server: m, Prefix: []byte("AAPI")}).Marshal()
+	if err != nil {
+		return err
+	}
+	return n.server(ctx, k, b)
+}
+
+func probeQuestion(text string) string {
+	text = strings.TrimSpace(text)
+	if rest, ok := cutModelPrefix(text, "алиса"); ok {
+		text = trimModelSeparator(rest)
+	}
+	if rest, ok := cutModelPrefix(text, "тест потока"); ok {
+		return trimModelSeparator(rest)
+	}
+	return ""
+}
+
+func (e *Engine) voiceProbe(text string) bool {
+	mode := os.Getenv("QUASAR_CHATGPT_VOICE_PROBE")
+	if mode != "early" && mode != "baseline" {
+		return false
+	}
+	lc, ok := e.LLM.(*llm.Client)
+	return ok && lc.API == "chatgpt" && probeQuestion(e.stripModelPrefix(text)) != ""
+}
+
+// Two syntheses at most: an unmarked first sentence, then the validated
+// remainder. This uses the existing progress player's two-source handover.
+func (n *Native) probeContext(p *nativeRequest) context.Context {
+	var buf string
+	done := false
+	return llm.WithTextPreview(p.ctx, func(delta string) error {
+		if err := p.ctx.Err(); err != nil {
+			return err
+		}
+		if done {
+			return nil
+		}
+		if len(buf)+len(delta) > 4096 {
+			done = true
+			return nil
+		}
+		buf += delta
+		plain := strings.TrimLeftFunc(buf, unicode.IsSpace)
+		for i, r := range plain {
+			if !strings.ContainsRune(".!?…", r) {
+				continue
+			}
+			end := i + utf8.RuneLen(r)
+			if end < len(plain) {
+				next, _ := utf8.DecodeRuneInString(plain[end:])
+				if !unicode.IsSpace(next) {
+					continue
+				}
+			}
+			s := plain[:end]
+			done = true
+			// Only natural-language previews. The normal final path handles
+			// links, markup, code and other structured output as a whole.
+			if strings.ContainsAny(s, "<>[]`*/:+@_#=|\\") || speechText(s) != s || llm.ValidateAnswer(s) != nil {
+				return nil
+			}
+			n.mu.Lock()
+			if p.canceled || p.ctx.Err() != nil {
+				n.mu.Unlock()
+				return context.Canceled
+			}
+			p.probePrefix = s
+			p.streaming, p.local = true, true
+			p.progressAudioDone = make(chan struct{})
+			p.ttsID, p.responseID = newID(), newID()
+			p.progressTTS = p.ttsID
+			p.listenOnStreamStart = true // a probe never launches media or tools
+			n.tts[p.ttsID] = p
+			n.mu.Unlock()
+			var err error
+			if p.gated {
+				err = n.sendCancel(p.ctx, p.id)
+			} else {
+				err = n.ack(p)
+			}
+			if err == nil {
+				err = n.beginDeferred(p)
+			}
+			if err != nil {
+				p.cancel()
+				return err
+			}
+			slog.Info("chatgpt_probe_first_tts", "request", requestTag(p.id), "ms", time.Since(p.probeStart).Milliseconds())
+			return nil
+		}
+		return nil
+	})
+}
+
+func (n *Native) finishProbe(p *nativeRequest, r Resolution) error {
+	// Wait for the first source to drain before changing its correlation ID,
+	// even when response.completed immediately follows the first delta.
+	select {
+	case <-p.ctx.Done():
+		return p.ctx.Err()
+	case <-p.progressAudioDone:
+	}
+	tail, ok := strings.CutPrefix(r.Answer, p.probePrefix)
+	// Use plain TTS for the probe. Raw Opus sources lack an explicit end
+	// marker for a chain of multiple logical streams generated by markup.
+	speech := tail
+	if !ok {
+		tail = " Не удалось подтвердить продолжение ответа."
+		speech = tail
+		slog.Info("chatgpt_probe_tail_mismatch", "request", requestTag(p.id))
+	}
+	if strings.TrimSpace(tail) == "" {
+		if err := n.deferredPart(p, "", "", true); err != nil {
+			return err
+		}
+		if err := n.finishSilentAudio(p); err != nil {
+			return err
+		}
+		reply.Delivered(p.ctx)
+		return nil
+	}
+	return n.finishDeferred(p, tail, speechText(tail), speechText(speech))
+}

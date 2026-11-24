@@ -40,6 +40,32 @@ func completedEvent(response string) string {
 	return "event: response.completed\ndata: {\"type\":\"response.completed\",\"response\":" + response + "}\n\n"
 }
 
+func TestSubscriptionPreviewIgnoresOtherOutput(t *testing.T) {
+	var heard strings.Builder
+	stream := `data: {"type":"provider.other","delta":{"meta":true}}
+
+data: {"type":"response.output_item.added","output_index":0,"item":{"type":"message","role":"assistant","phase":"commentary","id":"c"}}
+
+data: {"type":"response.output_text.delta","output_index":0,"content_index":0,"item_id":"c","delta":"commentary"}
+
+data: {"type":"response.output_item.added","output_index":2,"item":{"type":"message","role":"assistant","phase":"final_answer","id":"m"}}
+
+data: {"type":"response.output_text.delta","output_index":2,"content_index":0,"item_id":"other","delta":"wrong item"}
+
+data: {"type":"response.output_text.delta","output_index":2,"content_index":0,"item_id":"m","delta":"final text"}
+
+data: {"type":"response.incomplete"}
+
+`
+	_, err := readResponseStreamPreview(strings.NewReader(stream), func(s string) error { heard.WriteString(s); return nil })
+	if err == nil || !strings.Contains(err.Error(), "incomplete") || heard.String() != "final text" {
+		t.Fatalf("preview=%q err=%v", heard.String(), err)
+	}
+	if _, err := readResponseStream(strings.NewReader("data: {\"type\":\"provider.other\",\"delta\":{\"meta\":true}}\n\n" + completedEvent(responseAnswer))); err != nil {
+		t.Fatalf("ordinary subscription call rejected an unrelated event: %v", err)
+	}
+}
+
 func TestChatGPTRequestContract(t *testing.T) {
 	for _, structured := range []bool{false, true} {
 		t.Run(fmt.Sprint(structured), func(t *testing.T) {
