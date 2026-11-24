@@ -57,7 +57,7 @@ data: {"type":"response.output_text.delta","output_index":2,"content_index":0,"i
 data: {"type":"response.incomplete"}
 
 `
-	_, err := readResponseStreamPreview(strings.NewReader(stream), func(s string) error { heard.WriteString(s); return nil })
+	_, err := readResponseStreamPreview(strings.NewReader(stream), func(s string) error { heard.WriteString(s); return nil }, true)
 	if err == nil || !strings.Contains(err.Error(), "incomplete") || heard.String() != "final text" {
 		t.Fatalf("preview=%q err=%v", heard.String(), err)
 	}

@@ -4,8 +4,8 @@ import (
 	"context"
 	"errors"
 	"log/slog"
-	"os"
 	"strings"
+	"sync"
 	"unicode"
 	"unicode/utf8"
 
@@ -18,23 +18,21 @@ import (
 	server "github.com/skrashevich/quasar-go-genproto/proto/alice/protos/api/alicekit/protocol/server"
 )
 
-type probeTurnKey struct{}
-
 // Some UniProxy versions send a raw Opus BOS instead of TtsSpeak. Only
-// bind an unowned stream while one explicit probe is awaiting synthesis.
+// bind an unowned stream while one phrase response is awaiting synthesis.
 // Called under serverMu; use the regular correlated envelope/close handling.
-func (n *Native) bindProbeRaw(ctx context.Context, k websocket.MessageType, sid uint32) error {
+func (n *Native) bindRawPhrase(ctx context.Context, k websocket.MessageType, sid uint32) error {
 	n.mu.Lock()
-	delete(n.probeEnded, sid)
+	delete(n.endedRaw, sid)
 	var owner *nativeRequest
 	if n.streams[sid] == nil && n.cloudStreams[sid] == nil && n.blocked[sid] == nil {
 		for _, p := range n.requests {
-			if !p.probeSeek {
+			if !p.awaitingRaw {
 				continue
 			}
 			if owner != nil {
 				n.mu.Unlock()
-				return errors.New("ambiguous raw probe synthesis")
+				return errors.New("ambiguous raw phrase synthesis")
 			}
 			owner = p
 		}
@@ -45,11 +43,11 @@ func (n *Native) bindProbeRaw(ctx context.Context, k websocket.MessageType, sid 
 	}
 	if owner.canceled || owner.ctx.Err() != nil {
 		n.blocked[sid] = owner
-		owner.probeSeek = false
+		owner.awaitingRaw = false
 		n.mu.Unlock()
 		return nil
 	}
-	owner.probeRaw = true
+	owner.rawPhrase = true
 	id := owner.ttsID
 	n.mu.Unlock()
 	m := &server.TServerMessage{Message: &server.TServerMessage_Event{Event: &server.TServerMessage_TEvent{Header: &header.TEventHeader{MessageId: newID(), RefMessageId: id, StreamId: new(int64(sid))}, Event: &server.TServerMessage_TEvent_TtsSpeak{TtsSpeak: &tts.TTtsSpeak{Format: "audio/opus"}}}}}
@@ -60,28 +58,25 @@ func (n *Native) bindProbeRaw(ctx context.Context, k websocket.MessageType, sid 
 	return n.server(ctx, k, b)
 }
 
-func probeQuestion(text string) string {
-	text = strings.TrimSpace(text)
-	if rest, ok := cutModelPrefix(text, "алиса"); ok {
-		text = trimModelSeparator(rest)
-	}
-	if rest, ok := cutModelPrefix(text, "тест потока"); ok {
-		return trimModelSeparator(rest)
-	}
-	return ""
-}
-
-func (e *Engine) voiceProbe(text string) bool {
-	if os.Getenv("QUASAR_CHATGPT_VOICE_PROBE") != "phrases" {
+func (n *Native) streamsChatGPT() bool {
+	e, ok := n.resolver.(*Engine)
+	if !ok {
 		return false
 	}
 	lc, ok := e.LLM.(*llm.Client)
-	return ok && lc.API == "chatgpt" && probeQuestion(e.stripModelPrefix(text)) != ""
+	return ok && lc.API == "chatgpt"
 }
 
 // Start the first phrase immediately. The worker requests subsequent phrases
 // as their predecessors drain, without blocking the subscription stream.
-func (n *Native) probeContext(p *nativeRequest) (context.Context, func()) {
+func (n *Native) phraseContext(p *nativeRequest) (context.Context, func()) {
+	n.mu.Lock()
+	p.phraseSession = true
+	n.mu.Unlock()
+	stopProgress := func() {}
+	if !p.cloud && n.ProgressAfter > 0 {
+		stopProgress = sync.OnceFunc(n.progress(p))
+	}
 	pending := make(chan string, 4)
 	ctx, cancel := context.WithCancel(p.ctx)
 	exited := make(chan struct{})
@@ -92,14 +87,14 @@ func (n *Native) probeContext(p *nativeRequest) (context.Context, func()) {
 			case <-ctx.Done():
 				return
 			case s := <-pending:
-				if err := n.nextProbePhrase(ctx, p, s); err != nil {
+				if err := n.nextPhrase(ctx, p, s); err != nil {
 					return
 				}
 			}
 		}
 	}()
 	// Join the worker before the final reply consumes its spoken prefix.
-	stop := func() { cancel(); <-exited }
+	stop := func() { stopProgress(); cancel(); <-exited }
 	var buf string
 	done := false
 	return llm.WithTextPreview(p.ctx, func(delta string) error {
@@ -114,11 +109,11 @@ func (n *Native) probeContext(p *nativeRequest) (context.Context, func()) {
 			return nil
 		}
 		buf += delta
-		if p.probePrefix == "" {
+		if p.firstPhrase == "" {
 			buf = strings.TrimLeftFunc(buf, unicode.IsSpace)
 		}
 		for {
-			end := probeSentenceEnd(buf)
+			end := sentenceEnd(buf)
 			if end == 0 {
 				return nil
 			}
@@ -126,12 +121,17 @@ func (n *Native) probeContext(p *nativeRequest) (context.Context, func()) {
 			buf = buf[end:]
 			// Only natural-language previews. The normal final path handles
 			// links, markup, code and other structured output as a whole.
-			if strings.ContainsAny(s, "<>[]`*/:+@_#=|\\") || speechText(s) != s || llm.ValidateAnswer(s) != nil {
+			if strings.ContainsAny(s, "<>[]`*/+@_#=|\\") || speechText(s) != s || llm.ValidateAnswer(s) != nil {
 				done = true
 				return nil
 			}
-			if p.probePrefix == "" {
-				if err := n.startProbe(p, s); err != nil {
+			if p.firstPhrase == "" {
+				if n.hasSilentPlayback(p) {
+					done = true
+					return nil
+				}
+				stopProgress()
+				if err := n.startPhrases(p, s); err != nil {
 					return err
 				}
 			} else {
@@ -148,8 +148,21 @@ func (n *Native) probeContext(p *nativeRequest) (context.Context, func()) {
 	}), stop
 }
 
-func probeSentenceEnd(s string) int {
+func sentenceEnd(s string) int {
+	// A long answer need not contain punctuation. Keep the separator
+	// with the next phrase so the prefix still matches the final text.
+	const maxRunes = 160
+	var runes, boundary int
+	var inWord bool
 	for i, r := range s {
+		runes++
+		if unicode.IsSpace(r) && inWord {
+			boundary = i
+		}
+		inWord = !unicode.IsSpace(r)
+		if runes >= maxRunes && boundary > 0 {
+			return boundary
+		}
 		if !strings.ContainsRune(".!?…", r) {
 			continue
 		}
@@ -165,13 +178,19 @@ func probeSentenceEnd(s string) int {
 	return 0
 }
 
-func (n *Native) startProbe(p *nativeRequest, s string) error {
+func (n *Native) startPhrases(p *nativeRequest, s string) error {
 	n.mu.Lock()
 	if p.canceled || p.ctx.Err() != nil {
 		n.mu.Unlock()
 		return context.Canceled
 	}
-	p.probePrefix = s
+	if p.streaming {
+		// A slow model/tool turn already opened the progress player. Reuse
+		// it after the silent header source drains instead of opening again.
+		n.mu.Unlock()
+		return n.nextPhrase(p.ctx, p, s)
+	}
+	p.firstPhrase = s
 	p.streaming, p.local = true, true
 	p.progressAudioDone = make(chan struct{})
 	p.ttsID, p.responseID = newID(), newID()
@@ -180,7 +199,7 @@ func (n *Native) startProbe(p *nativeRequest, s string) error {
 	n.tts[p.ttsID] = p
 	n.mu.Unlock()
 	var err error
-	if p.gated {
+	if p.gated || p.cloud {
 		err = n.sendCancel(p.ctx, p.id)
 	} else {
 		err = n.ack(p)
@@ -195,7 +214,7 @@ func (n *Native) startProbe(p *nativeRequest, s string) error {
 	return nil
 }
 
-func (n *Native) nextProbePhrase(ctx context.Context, p *nativeRequest, s string) error {
+func (n *Native) nextPhrase(ctx context.Context, p *nativeRequest, s string) error {
 	select {
 	case <-ctx.Done():
 		return ctx.Err()
@@ -207,6 +226,10 @@ func (n *Native) nextProbePhrase(ctx context.Context, p *nativeRequest, s string
 		return context.Canceled
 	}
 	p.progressAudioDone = make(chan struct{})
+	first := p.firstPhrase == ""
+	if first {
+		p.firstPhrase = s
+	}
 	p.ttsID = newID()
 	p.progressTTS = p.ttsID // intermediate source: swallow Close, retain player
 	n.tts[p.ttsID] = p
@@ -219,22 +242,25 @@ func (n *Native) nextProbePhrase(ctx context.Context, p *nativeRequest, s string
 		p.cancel()
 		return err
 	}
-	p.probeSuffix.WriteString(s)
+	if !first {
+		p.laterPhrases.WriteString(s)
+	}
 	return nil
 }
 
-func (n *Native) finishProbe(p *nativeRequest, r Resolution) error {
-	tail, ok := strings.CutPrefix(r.Answer, p.probePrefix+p.probeSuffix.String())
+func (n *Native) finishPhrases(p *nativeRequest, r Resolution) error {
+	select {
+	case <-p.ctx.Done():
+		return p.ctx.Err()
+	case <-p.progressAudioDone:
+	}
+	spoken := p.firstPhrase + p.laterPhrases.String()
+	tail, ok := strings.CutPrefix(r.Answer, spoken)
 	if !ok {
 		tail = " Не удалось подтвердить продолжение ответа."
-		slog.Info("chatgpt_probe_tail_mismatch", "request", requestTag(p.id))
+		slog.Info("chatgpt_speech_tail_mismatch", "request", requestTag(p.id))
 	}
 	if strings.TrimSpace(tail) == "" {
-		select {
-		case <-p.ctx.Done():
-			return p.ctx.Err()
-		case <-p.progressAudioDone:
-		}
 		if err := n.deferredPart(p, "", "", true); err != nil {
 			return err
 		}
@@ -244,7 +270,17 @@ func (n *Native) finishProbe(p *nativeRequest, r Resolution) error {
 		reply.Delivered(p.ctx)
 		return nil
 	}
-	// Use plain TTS: raw Opus lacks a close for chains produced by markup.
-	speech := speechText(tail)
-	return n.finishDeferred(p, tail, speech, speech)
+	voice := speechText(tail)
+	speech := voice
+	// Keep model-requested TTS markup on correlated streams. Raw Opus
+	// lacks a close identifying the end of a chain produced by markup.
+	n.mu.Lock()
+	raw := p.rawPhrase
+	n.mu.Unlock()
+	if ok && r.speech != "" && !raw {
+		if rest, match := strings.CutPrefix(r.speech, spoken); match {
+			speech = speechText(rest)
+		}
+	}
+	return n.finishDeferred(p, tail, voice, speech)
 }

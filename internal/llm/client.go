@@ -172,7 +172,7 @@ func (c *Client) chatCompletions(ctx context.Context, messages []Message, struct
 		request["tool_choice"] = "auto"
 		request["parallel_tool_calls"] = false
 	}
-	data, err := c.post(ctx, "/chat/completions", request)
+	data, err := c.post(ctx, "/chat/completions", request, nil)
 	if err != nil {
 		return Message{}, err
 	}
@@ -202,7 +202,7 @@ func (c *Client) chatCompletions(ctx context.Context, messages []Message, struct
 	return m, nil
 }
 
-func (c *Client) post(ctx context.Context, path string, request any) ([]byte, error) {
+func (c *Client) post(ctx context.Context, path string, request map[string]any, emit func(string) error) ([]byte, error) {
 	ctx, cancel := context.WithTimeout(ctx, 60*time.Second)
 	defer cancel()
 	baseURL, apiKey := c.BaseURL, c.APIKey
@@ -265,8 +265,7 @@ func (c *Client) post(ctx context.Context, path string, request any) ([]byte, er
 		return nil, llmHTTPError(resp)
 	}
 	if c.API == "chatgpt" {
-		emit, _ := ctx.Value(textPreviewKey{}).(func(string) error)
-		data, err := readResponseStreamPreview(resp.Body, emit)
+		data, err := readResponseStreamPreview(resp.Body, emit, request["tools"] != nil)
 		if err != nil && ctx.Err() != nil {
 			return nil, fmt.Errorf("LLM transport: %w", ctx.Err())
 		}

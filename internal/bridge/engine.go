@@ -197,10 +197,6 @@ func (e *Engine) ResolveDecision(ctx context.Context, text string, decision Rout
 		result.Answer = answer
 		return result, err
 	case "llm":
-		if decision.Source == "chatgpt_voice_probe" {
-			ctx = context.WithValue(ctx, probeTurnKey{}, true)
-			text = probeQuestion(e.stripModelPrefix(text))
-		}
 		return e.Fallback(ctx, text)
 	default:
 		return Resolution{Route: "yandex"}, nil
@@ -215,9 +211,7 @@ func (e *Engine) Fallback(ctx context.Context, text string) (Resolution, error) 
 		return r, errors.New("LLM is not configured")
 	}
 	answerer := e.LLM
-	if ctx.Value(probeTurnKey{}) == true {
-		ctx = llm.WithoutHostedTools(ctx)
-	} else if e.Assistant != nil {
+	if e.Assistant != nil {
 		answerer = e.Assistant
 	}
 	ctx, snapshot, ticket := e.dialogue().Start(ctx)
@@ -313,9 +307,6 @@ func (e *Engine) Decide(ctx context.Context, text string) (decision RouteDecisio
 	}()
 	awaitingHomeReply := snapshot.Route == "home" && e.dialogue().TakeHomeQuestion(ctx, ticket)
 	p := e.policy()
-	if e.voiceProbe(text) {
-		return RouteDecision{Route: "llm", Source: "chatgpt_voice_probe"}
-	}
 	if configvoice.RecoveryAction(text) != "" {
 		return RouteDecision{Route: "recovery", Source: "bridge_recovery"}
 	}

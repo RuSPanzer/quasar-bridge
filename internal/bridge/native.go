@@ -49,49 +49,49 @@ type FallbackResolver interface {
 }
 
 type nativeRequest struct {
-	audioInput                      []byte
-	audioInputDone                  bool
-	inputWhisper                    bool
-	streaming                       bool
-	listenOnStreamStart             bool
-	partial                         uint32
-	responseID                      string
-	final                           bool
-	aggregateSeen                   bool
-	aggregateFinalSeen              bool
-	header                          *header.TEventHeader
-	isText                          bool
-	ttsStarted                      bool
-	gated                           bool
-	input                           []byte
-	id                              string
-	request                         *request.TAliceRequestProto
-	text                            string
-	route                           string
-	ctx                             context.Context
-	cancel                          context.CancelFunc
-	started, canceled, local, cloud bool
-	outputPending                   bool
-	cloudFrames                     []cloudFrame
-	cloudBytes                      int
-	continuation                    []byte
-	ttsID                           string
-	progressTTS                     string
-	markedTTS                       bool // <speaker> can produce chained Opus streams.
-	audio                           oggSpeech
-	audioIsProgress                 bool
-	audioStarted                    bool
-	audioStream                     uint32
-	audioWaiting                    bool
-	progressAudioDone               chan struct{}
-	probePrefix                     string          // Nonempty when the first deferred segment is actual speech.
-	probeSuffix                     strings.Builder // Written by the phrase worker; read after it is joined.
-	audioGap                        int
-	probeSeek, probeRaw             bool // protected by Native.mu
-	soundRequest                    *sound.Request
-	soundDirective                  *soundDirective
-	soundSealed                     bool
-	expires                         *time.Timer
+	audioInput                            []byte
+	audioInputDone                        bool
+	inputWhisper                          bool
+	streaming                             bool
+	listenOnStreamStart                   bool
+	partial                               uint32
+	responseID                            string
+	final                                 bool
+	aggregateSeen                         bool
+	aggregateFinalSeen                    bool
+	header                                *header.TEventHeader
+	isText                                bool
+	ttsStarted                            bool
+	gated                                 bool
+	input                                 []byte
+	id                                    string
+	request                               *request.TAliceRequestProto
+	text                                  string
+	route                                 string
+	ctx                                   context.Context
+	cancel                                context.CancelFunc
+	started, canceled, local, cloud       bool
+	outputPending                         bool
+	cloudFrames                           []cloudFrame
+	cloudBytes                            int
+	continuation                          []byte
+	ttsID                                 string
+	progressTTS                           string
+	markedTTS                             bool // <speaker> can produce chained Opus streams.
+	audio                                 oggSpeech
+	audioIsProgress                       bool
+	audioStarted                          bool
+	audioStream                           uint32
+	audioWaiting                          bool
+	progressAudioDone                     chan struct{}
+	firstPhrase                           string          // Nonempty when the first phrase has been sent to TTS.
+	laterPhrases                          strings.Builder // Written by the phrase worker; read after it is joined.
+	audioGap                              int
+	phraseSession, awaitingRaw, rawPhrase bool // protected by Native.mu
+	soundRequest                          *sound.Request
+	soundDirective                        *soundDirective
+	soundSealed                           bool
+	expires                               *time.Timer
 }
 type Native struct {
 	connectionScope  string
@@ -106,7 +106,7 @@ type Native struct {
 	streams          map[uint32]*nativeRequest
 	blocked          map[uint32]*nativeRequest
 	cloudStreams     map[uint32]*nativeRequest
-	probeEnded       map[uint32]*nativeRequest // suppress a late Close following raw Opus EOS
+	endedRaw         map[uint32]*nativeRequest // suppress a late Close following raw Opus EOS
 	cloudBytes       int
 	wg               sync.WaitGroup
 	OnRoute          func(id, route string)
@@ -233,16 +233,16 @@ func (n *Native) Client(ctx context.Context, k websocket.MessageType, data []byt
 			delete(n.requests, p.id)
 			delete(n.tts, p.ttsID)
 			delete(n.tts, p.progressTTS)
-			if p.probePrefix != "" {
+			if p.phraseSession {
 				for id, owner := range n.tts {
 					if owner == p {
 						delete(n.tts, id)
 					}
 				}
 			}
-			for sid, owner := range n.probeEnded {
+			for sid, owner := range n.endedRaw {
 				if owner == p {
-					delete(n.probeEnded, sid)
+					delete(n.endedRaw, sid)
 				}
 			}
 			for stream, q := range n.blocked {
@@ -346,7 +346,7 @@ func (n *Native) server(ctx context.Context, k websocket.MessageType, data []byt
 		if len(data) >= 4 {
 			sid := binary.BigEndian.Uint32(data)
 			if len(data) >= 10 && string(data[4:8]) == "OggS" && data[9]&2 != 0 {
-				if err := n.bindProbeRaw(ctx, k, sid); err != nil {
+				if err := n.bindRawPhrase(ctx, k, sid); err != nil {
 					return err
 				}
 			}
@@ -355,7 +355,7 @@ func (n *Native) server(ctx context.Context, k websocket.MessageType, data []byt
 			drop := n.blocked[sid] != nil || (p != nil && p.canceled)
 			if p != nil && (p.streaming || p.markedTTS) && !drop {
 				out, err := p.audio.feed(data[4:])
-				rawEOS := p.probeRaw && p.audio.source.ended && len(p.audio.source.buffer) == 0
+				rawEOS := p.rawPhrase && p.audio.source.ended && len(p.audio.source.buffer) == 0
 				if err == nil && len(out) > 0 {
 					err = n.down(ctx, k, append(binary.BigEndian.AppendUint32(nil, p.audioStream), out...))
 				}
@@ -372,10 +372,10 @@ func (n *Native) server(ctx context.Context, k websocket.MessageType, data []byt
 						return err
 					}
 					n.mu.Lock()
-					if n.probeEnded == nil {
-						n.probeEnded = make(map[uint32]*nativeRequest)
+					if n.endedRaw == nil {
+						n.endedRaw = make(map[uint32]*nativeRequest)
 					}
-					n.probeEnded[sid] = p
+					n.endedRaw[sid] = p
 					n.mu.Unlock()
 				}
 				return err
@@ -389,8 +389,8 @@ func (n *Native) server(ctx context.Context, k websocket.MessageType, data []byt
 	}
 	if sc := f.Server.GetStreamControl(); sc != nil {
 		n.mu.Lock()
-		if p := n.probeEnded[uint32(sc.GetStreamId())]; p != nil && sc.GetClose() != nil && (sc.GetMessageId() == "" || sc.GetMessageId() == p.ttsID || sc.GetMessageId() == p.progressTTS) {
-			delete(n.probeEnded, uint32(sc.GetStreamId()))
+		if p := n.endedRaw[uint32(sc.GetStreamId())]; p != nil && sc.GetClose() != nil && (sc.GetMessageId() == "" || sc.GetMessageId() == p.ttsID || sc.GetMessageId() == p.progressTTS) {
+			delete(n.endedRaw, uint32(sc.GetStreamId()))
 			n.mu.Unlock()
 			return nil
 		}
@@ -402,7 +402,7 @@ func (n *Native) server(ctx context.Context, k websocket.MessageType, data []byt
 			return nil
 		}
 		p := n.tts[sc.GetMessageId()]
-		if p != nil && p.probePrefix != "" && sc.GetMessageId() != p.ttsID {
+		if p != nil && p.phraseSession && sc.GetMessageId() != p.ttsID {
 			// A late control frame for a retired source cannot close the
 			// next one, even when UniProxy recycles the stream number.
 			n.mu.Unlock()
@@ -421,7 +421,7 @@ func (n *Native) server(ctx context.Context, k websocket.MessageType, data []byt
 				return nil
 			}
 			if (p.streaming || p.markedTTS) && sc.GetClose() != nil {
-				if p.probePrefix != "" && p.audioIsProgress && sc.GetClose().GetReason() != 0 {
+				if p.phraseSession && p.audioIsProgress && sc.GetClose().GetReason() != 0 {
 					p.cancel()
 				}
 				if err := p.audio.endSource(); err != nil {
@@ -478,7 +478,7 @@ func (n *Native) server(ctx context.Context, k websocket.MessageType, data []byt
 
 	n.mu.Lock()
 	if f.Kind() == "TtsSpeak" {
-		delete(n.probeEnded, uint32(e.GetHeader().GetStreamId()))
+		delete(n.endedRaw, uint32(e.GetHeader().GetStreamId()))
 		delete(n.streams, uint32(e.GetHeader().GetStreamId()))
 		delete(n.blocked, uint32(e.GetHeader().GetStreamId()))
 	}
@@ -497,9 +497,9 @@ func (n *Native) server(ctx context.Context, k websocket.MessageType, data []byt
 	}
 	if isTTS {
 		if p.canceled {
-			if e.GetTtsSpeak() != nil && p.probePrefix != "" {
+			if e.GetTtsSpeak() != nil && p.phraseSession {
 				n.blocked[uint32(e.GetHeader().GetStreamId())] = p
-				p.probeSeek = false
+				p.awaitingRaw = false
 			}
 			n.mu.Unlock()
 			return nil
@@ -510,7 +510,7 @@ func (n *Native) server(ctx context.Context, k websocket.MessageType, data []byt
 			ref.RequestId = p.request.GetHeader().GetRequestId()
 		}
 		if e.GetTtsSpeak() != nil {
-			p.probeSeek = false
+			p.awaitingRaw = false
 			n.streams[uint32(e.Header.GetStreamId())] = p
 			if p.streaming || p.markedTTS {
 				if e.GetTtsSpeak().GetFormat() != "audio/opus" {
@@ -520,7 +520,7 @@ func (n *Native) server(ctx context.Context, k websocket.MessageType, data []byt
 				}
 				p.audioIsProgress = p.ttsID == p.progressTTS
 				p.audio.next()
-				p.audio.source.discardAudio = p.audioIsProgress && p.probePrefix == ""
+				p.audio.source.discardAudio = p.audioIsProgress && p.firstPhrase == ""
 				if p.audioStarted {
 					p.audioWaiting = false
 					n.mu.Unlock()
@@ -567,12 +567,15 @@ func (n *Native) server(ctx context.Context, k websocket.MessageType, data []byt
 			if n.OnRoute != nil {
 				n.OnRoute(p.id, "llm")
 			}
-			p.ttsID = newID()
-			n.tts[p.ttsID] = p
 			query := p.text
 			n.mu.Unlock()
 			n.wg.Go(func() {
-				result, err := resolver.Fallback(p.ctx, query)
+				resolveCtx, stop := p.ctx, func() {}
+				if n.streamsChatGPT() {
+					resolveCtx, stop = n.phraseContext(p)
+				}
+				result, err := resolver.Fallback(resolveCtx, query)
+				stop()
 				if p.ctx.Err() != nil {
 					return
 				}
@@ -584,7 +587,13 @@ func (n *Native) server(ctx context.Context, k websocket.MessageType, data []byt
 					n.discardSound(p)
 					result.Answer = "Сейчас не получилось получить ответ локальной модели."
 				}
-				_ = n.sendCancel(p.ctx, p.id)
+				if !p.streaming {
+					n.mu.Lock()
+					p.ttsID = newID()
+					n.tts[p.ttsID] = p
+					n.mu.Unlock()
+					_ = n.sendCancel(p.ctx, p.id)
+				}
 				if err := n.reply(p, result); err != nil {
 					slog.Warn("native_reply_failed", "request", requestTag(p.id))
 				}
@@ -681,8 +690,8 @@ func (n *Native) maybeResolve(p *nativeRequest) {
 				slog.Info("native_route_decision", "request", requestTag(p.id), "route", decision.Route, "source", decision.Source)
 				stop := func() {}
 				resolveCtx := p.ctx
-				if decision.Source == "chatgpt_voice_probe" {
-					resolveCtx, stop = n.probeContext(p)
+				if decision.Route == "llm" && n.streamsChatGPT() {
+					resolveCtx, stop = n.phraseContext(p)
 				} else if decision.Route != "yandex" && n.ProgressAfter > 0 {
 					stop = n.progress(p)
 				}
@@ -802,8 +811,8 @@ func (n *Native) sendCancel(ctx context.Context, id string) error {
 	return n.up(ctx, websocket.MessageBinary, b)
 }
 func (n *Native) reply(p *nativeRequest, result Resolution) error {
-	if p.probePrefix != "" {
-		return n.finishProbe(p, result)
+	if p.firstPhrase != "" {
+		return n.finishPhrases(p, result)
 	}
 	text := result.Answer
 	voice := text
@@ -847,7 +856,7 @@ func (n *Native) reply(p *nativeRequest, result Resolution) error {
 	return n.synthesize(p, speech)
 }
 func (n *Native) synthesize(p *nativeRequest, text string) error {
-	if p.inputWhisper && p.probePrefix == "" {
+	if p.inputWhisper {
 		text = `<speaker is_whisper="true">` + text
 		slog.Info("tts_whisper_enabled", "request", requestTag(p.id))
 	}
@@ -862,9 +871,9 @@ func (n *Native) synthesize(p *nativeRequest, text string) error {
 		return err
 	}
 	n.mu.Lock()
-	if p.probePrefix != "" {
-		p.probeSeek = true
-		p.probeRaw = false
+	if p.phraseSession && p.streaming {
+		p.awaitingRaw = true
+		p.rawPhrase = false
 	}
 	n.mu.Unlock()
 	return n.up(p.ctx, websocket.MessageBinary, b)

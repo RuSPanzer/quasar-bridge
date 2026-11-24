@@ -112,7 +112,11 @@ func (c *Client) responses(ctx context.Context, messages []Message, structured b
 	if len(tools) > 0 {
 		request["parallel_tool_calls"] = false
 	}
-	data, err := c.post(ctx, "/responses", request)
+	var emit func(string) error
+	if subscription && !structured {
+		emit, _ = ctx.Value(textPreviewKey{}).(func(string) error)
+	}
+	data, err := c.post(ctx, "/responses", request, emit)
 	if err != nil {
 		return Message{}, err
 	}
@@ -149,6 +153,7 @@ func parseResponse(data []byte) (Message, error) {
 		var item struct {
 			Type      string `json:"type"`
 			Role      string `json:"role"`
+			Phase     string `json:"phase"`
 			Status    string `json:"status"`
 			CallID    string `json:"call_id"`
 			Name      string `json:"name"`
@@ -166,7 +171,7 @@ func parseResponse(data []byte) (Message, error) {
 			if item.Status != "" && item.Status != "completed" {
 				return Message{}, errors.New("LLM message incomplete")
 			}
-			if item.Role != "assistant" {
+			if item.Role != "assistant" || (item.Phase != "" && item.Phase != "final_answer") {
 				continue
 			}
 			for _, part := range item.Content {
