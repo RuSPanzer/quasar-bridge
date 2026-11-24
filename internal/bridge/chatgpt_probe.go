@@ -74,16 +74,43 @@ func probeQuestion(text string) string {
 
 func (e *Engine) voiceProbe(text string) bool {
 	mode := os.Getenv("QUASAR_CHATGPT_VOICE_PROBE")
-	if mode != "early" && mode != "baseline" {
+	if mode != "early" && mode != "baseline" && mode != "phrases" {
 		return false
 	}
 	lc, ok := e.LLM.(*llm.Client)
 	return ok && lc.API == "chatgpt" && probeQuestion(e.stripModelPrefix(text)) != ""
 }
 
-// Two syntheses at most: an unmarked first sentence, then the validated
-// remainder. This uses the existing progress player's two-source handover.
-func (n *Native) probeContext(p *nativeRequest) context.Context {
+// The first phrase starts immediately in both experiments. In phrases mode
+// one worker can request another synthesis when the previous *source* drains,
+// while the station still plays buffered audio and ChatGPT is still writing.
+func (n *Native) probeContext(p *nativeRequest, phrases bool) (context.Context, func()) {
+	var pending chan string
+	stop := func() {}
+	if phrases {
+		pending = make(chan string, 4)
+		ctx, cancel := context.WithCancel(p.ctx)
+		exited := make(chan struct{})
+		go func() {
+			defer close(exited)
+			for {
+				select {
+				case <-ctx.Done():
+					return
+				case s := <-pending:
+					if err := n.nextProbePhrase(ctx, p, s); err != nil {
+						if ctx.Err() == nil {
+							p.cancel()
+						}
+						return
+					}
+				}
+			}
+		}()
+		// Once the authoritative answer arrives, synthesize any unsent
+		// backlog together as its tail rather than delaying the final reply.
+		stop = func() { cancel(); <-exited }
+	}
 	var buf string
 	done := false
 	return llm.WithTextPreview(p.ctx, func(delta string) error {
@@ -98,56 +125,123 @@ func (n *Native) probeContext(p *nativeRequest) context.Context {
 			return nil
 		}
 		buf += delta
-		plain := strings.TrimLeftFunc(buf, unicode.IsSpace)
-		for i, r := range plain {
-			if !strings.ContainsRune(".!?…", r) {
-				continue
+		if p.probePrefix == "" {
+			buf = strings.TrimLeftFunc(buf, unicode.IsSpace)
+		}
+		for {
+			end := probeSentenceEnd(buf)
+			if end == 0 {
+				return nil
 			}
-			end := i + utf8.RuneLen(r)
-			if end < len(plain) {
-				next, _ := utf8.DecodeRuneInString(plain[end:])
-				if !unicode.IsSpace(next) {
-					continue
-				}
-			}
-			s := plain[:end]
-			done = true
+			s := buf[:end]
+			buf = buf[end:]
 			// Only natural-language previews. The normal final path handles
 			// links, markup, code and other structured output as a whole.
 			if strings.ContainsAny(s, "<>[]`*/:+@_#=|\\") || speechText(s) != s || llm.ValidateAnswer(s) != nil {
+				done = true
 				return nil
 			}
-			n.mu.Lock()
-			if p.canceled || p.ctx.Err() != nil {
-				n.mu.Unlock()
-				return context.Canceled
-			}
-			p.probePrefix = s
-			p.streaming, p.local = true, true
-			p.progressAudioDone = make(chan struct{})
-			p.ttsID, p.responseID = newID(), newID()
-			p.progressTTS = p.ttsID
-			p.listenOnStreamStart = true // a probe never launches media or tools
-			n.tts[p.ttsID] = p
-			n.mu.Unlock()
-			var err error
-			if p.gated {
-				err = n.sendCancel(p.ctx, p.id)
+			if p.probePrefix == "" {
+				if err := n.startProbe(p, s); err != nil {
+					return err
+				}
+				if !phrases {
+					done = true
+					return nil
+				}
 			} else {
-				err = n.ack(p)
+				select {
+				case pending <- s:
+				default:
+					// Preserve a contiguous preview prefix; never skip a
+					// phrase or hold up the network reader for slow TTS.
+					done = true
+					return nil
+				}
 			}
-			if err == nil {
-				err = n.beginDeferred(p)
-			}
-			if err != nil {
-				p.cancel()
-				return err
-			}
-			slog.Info("chatgpt_probe_first_tts", "request", requestTag(p.id), "ms", time.Since(p.probeStart).Milliseconds())
-			return nil
 		}
-		return nil
-	})
+	}), stop
+}
+
+func probeSentenceEnd(s string) int {
+	for i, r := range s {
+		if !strings.ContainsRune(".!?…", r) {
+			continue
+		}
+		end := i + utf8.RuneLen(r)
+		if end == len(s) {
+			return end
+		}
+		next, _ := utf8.DecodeRuneInString(s[end:])
+		if unicode.IsSpace(next) {
+			return end
+		}
+	}
+	return 0
+}
+
+func (n *Native) startProbe(p *nativeRequest, s string) error {
+	n.mu.Lock()
+	if p.canceled || p.ctx.Err() != nil {
+		n.mu.Unlock()
+		return context.Canceled
+	}
+	p.probePrefix = s
+	p.probePart = 1
+	p.streaming, p.local = true, true
+	p.progressAudioDone = make(chan struct{})
+	p.ttsID, p.responseID = newID(), newID()
+	p.progressTTS = p.ttsID
+	p.listenOnStreamStart = true
+	n.tts[p.ttsID] = p
+	n.mu.Unlock()
+	var err error
+	if p.gated {
+		err = n.sendCancel(p.ctx, p.id)
+	} else {
+		err = n.ack(p)
+	}
+	if err == nil {
+		err = n.beginDeferred(p)
+	}
+	if err != nil {
+		p.cancel()
+		return err
+	}
+	slog.Info("chatgpt_probe_first_tts", "request", requestTag(p.id), "ms", time.Since(p.probeStart).Milliseconds())
+	return nil
+}
+
+func (n *Native) nextProbePhrase(ctx context.Context, p *nativeRequest, s string) error {
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-p.progressAudioDone:
+	}
+	n.mu.Lock()
+	if ctx.Err() != nil || p.canceled {
+		n.mu.Unlock()
+		return context.Canceled
+	}
+	p.progressAudioDone = make(chan struct{})
+	p.ttsID = newID()
+	p.progressTTS = p.ttsID // intermediate source: swallow Close, retain player
+	p.probePart++
+	part := p.probePart
+	p.probeAudioLogged = false
+	n.tts[p.ttsID] = p
+	n.mu.Unlock()
+	if err := n.deferredPart(p, s, s, false); err != nil {
+		p.cancel()
+		return err
+	}
+	if err := n.synthesize(p, s); err != nil {
+		p.cancel()
+		return err
+	}
+	p.probeSuffix.WriteString(s)
+	slog.Info("chatgpt_probe_phrase_tts", "request", requestTag(p.id), "part", part, "ms", time.Since(p.probeStart).Milliseconds())
+	return nil
 }
 
 func (n *Native) finishProbe(p *nativeRequest, r Resolution) error {
@@ -158,7 +252,7 @@ func (n *Native) finishProbe(p *nativeRequest, r Resolution) error {
 		return p.ctx.Err()
 	case <-p.progressAudioDone:
 	}
-	tail, ok := strings.CutPrefix(r.Answer, p.probePrefix)
+	tail, ok := strings.CutPrefix(r.Answer, p.probePrefix+p.probeSuffix.String())
 	// Use plain TTS for the probe. Raw Opus sources lack an explicit end
 	// marker for a chain of multiple logical streams generated by markup.
 	speech := tail

@@ -30,22 +30,33 @@ func (f probeTransport) RoundTrip(r *http.Request) (*http.Response, error) { ret
 // text or keepalive silence) have reached the station-facing writer.
 func TestChatGPTProbeAudioBeforeCompletion(t *testing.T) {
 	for _, tc := range []struct {
-		name string
-		raw  bool
-		tail string
+		name    string
+		raw     bool
+		tail    string
+		mode    string
+		backlog bool
 	}{
-		{"envelopes", false, " Вторая фраза."},
-		{"raw-reused-id", true, " Вторая фраза."},
-		{"raw-no-tail", true, ""},
+		{"envelopes", false, " Вторая фраза.", "early", false},
+		{"raw-reused-id", true, " Вторая фраза.", "early", false},
+		{"raw-no-tail", true, "", "early", false},
+		{"phrases", false, " И конец", "phrases", false},
+		{"phrases-raw-no-tail", true, "", "phrases", false},
+		{"completed-with-backlog", false, " И конец", "phrases", true},
 	} {
-		t.Run(tc.name, func(t *testing.T) { testChatGPTProbe(t, tc.raw, tc.tail) })
+		t.Run(tc.name, func(t *testing.T) { testChatGPTProbe(t, tc.raw, tc.tail, tc.mode, tc.backlog) })
 	}
 }
-func testChatGPTProbe(t *testing.T, raw bool, tail string) {
-	t.Setenv("QUASAR_CHATGPT_VOICE_PROBE", "early")
+func testChatGPTProbe(t *testing.T, raw bool, tail, mode string, backlog bool) {
+	t.Setenv("QUASAR_CHATGPT_VOICE_PROBE", mode)
 	release := make(chan struct{})
 	unblock := sync.OnceFunc(func() { close(release) })
 	const first = "Первая фраза."
+	const second, third = " Вторая фраза!", " Третья фраза?"
+	answer := first
+	if mode == "phrases" {
+		answer += second + third
+	}
+	answer += tail
 	lc := &llm.Client{API: "chatgpt", Model: "fixture", HostedTools: []string{"web_search"}, AccessToken: func(context.Context) (string, error) { return "fixture", nil }}
 	lc.HTTP = &http.Client{Transport: probeTransport(func(req *http.Request) (*http.Response, error) {
 		var body map[string]any
@@ -59,12 +70,15 @@ func testChatGPTProbe(t *testing.T, raw bool, tail string) {
 			io.WriteString(w, "data: {\"type\":\"response.output_item.added\",\"output_index\":1,\"item\":{\"id\":\"m1\",\"type\":\"message\",\"role\":\"assistant\",\"phase\":\"final_answer\"}}\n\n")
 			io.WriteString(w, "data: {\"type\":\"response.output_text.delta\",\"item_id\":\"m1\",\"output_index\":1,\"content_index\":0,\"delta\":\"Первая фра\"}\n\n")
 			io.WriteString(w, "data: {\"type\":\"response.output_text.delta\",\"item_id\":\"m1\",\"output_index\":1,\"content_index\":0,\"delta\":\"за.\"}\n\n")
+			if mode == "phrases" {
+				io.WriteString(w, "data: {\"type\":\"response.output_text.delta\",\"item_id\":\"m1\",\"output_index\":1,\"content_index\":0,\"delta\":\""+second+third+"\"}\n\n")
+			}
 			select {
 			case <-req.Context().Done():
 				return
 			case <-release:
 			}
-			io.WriteString(w, "data: {\"type\":\"response.completed\",\"response\":{\"status\":\"completed\",\"output\":[{\"type\":\"message\",\"role\":\"assistant\",\"content\":[{\"type\":\"output_text\",\"text\":\""+first+tail+"\"}]}]}}\n\n")
+			io.WriteString(w, "data: {\"type\":\"response.completed\",\"response\":{\"status\":\"completed\",\"output\":[{\"type\":\"message\",\"role\":\"assistant\",\"content\":[{\"type\":\"output_text\",\"text\":\""+answer+"\"}]}]}}\n\n")
 		}()
 		return &http.Response{StatusCode: 200, Header: make(http.Header), Body: r}, nil
 	})}
@@ -82,6 +96,8 @@ func testChatGPTProbe(t *testing.T, raw bool, tail string) {
 		down <- wire.Decode(b, wire.ServerToClient)
 		return nil
 	}, engine)
+	resolved := make(chan struct{}, 1)
+	n.OnRoute = func(_, _ string) { resolved <- struct{}{} }
 	defer n.Close()
 	defer unblock()
 	input := &client.TClientMessage{Message: &client.TClientMessage_Event{Event: &client.TClientMessage_TEvent{Header: &header.TEventHeader{MessageId: "probe"}, Event: &client.TClientMessage_TEvent_VoiceInput{VoiceInput: &request.TAliceRequestProto{Request: &request.TAliceRequestProto_TRequest{Event: &common.TEvent{Text: new("тест потока расскажи историю")}}}}}}}
@@ -116,10 +132,44 @@ func testChatGPTProbe(t *testing.T, raw bool, tail string) {
 			t.Fatal(err)
 		}
 	}
-	feed(nextTTS(first), 71, packet)
+	firstID := nextTTS(first)
+	if backlog {
+		// Hold the first synth open until the authoritative model response
+		// has been read AND the phrase worker joined. SSE must not be blocked
+		// by a slow TTS or require a second HTTP request for the remainder.
+		unblock()
+		select {
+		case <-resolved:
+		case <-time.After(2 * time.Second):
+			t.Fatal("completion waited for slow synthesis")
+		}
+	}
+	feed(firstID, 71, packet)
+	earlyPackets := [][]byte{packet}
+	if mode == "phrases" && !backlog {
+		for i, part := range []string{second, third} {
+			marker := []byte{0xf8, 0x12, 0x34, byte(i + 1)}
+			feed(nextTTS(part), uint32(73+i), marker)
+			earlyPackets = append(earlyPackets, marker)
+		}
+	}
 	var voice, text strings.Builder
+	var audio []byte
+	open, last := 0, 0
 	collect := func(f wire.Frame) {
+		if f.Kind() == "opaque" {
+			if binary.BigEndian.Uint32(f.Raw) != 71 {
+				t.Fatalf("audio on a second player stream: %x", f.Raw[:4])
+			}
+			audio = append(audio, f.Raw[4:]...)
+		}
+		if f.Kind() == "TtsSpeak" {
+			open++
+		}
 		if part := f.Server.GetEvent().GetDeferredAliceResponse(); part != nil {
+			if part.GetIsLast() {
+				last++
+			}
 			text.WriteString(part.GetBaseResponse().GetText())
 			b := part.GetBaseResponse().ProtoReflect().GetUnknown()
 			_, _, k := protowire.ConsumeTag(b)
@@ -129,21 +179,25 @@ func testChatGPTProbe(t *testing.T, raw bool, tail string) {
 			}
 		}
 	}
-	earlyAudio := false
 	for len(down) > 0 {
 		f := <-down
 		collect(f)
-		if f.Kind() == "opaque" && bytes.Contains(f.Raw, packet) {
-			earlyAudio = true
-		}
 		if f.Server.GetStreamControl().GetClose() != nil {
 			t.Fatal("closed before second part")
 		}
 	}
-	if !earlyAudio {
-		t.Fatal("no first speech payload before response.completed")
+	if last != 0 && !backlog {
+		t.Fatal("final text before response.completed")
+	}
+	for _, marker := range earlyPackets {
+		if bytes.Count(audio, marker) != 1 {
+			t.Fatalf("expected one speech packet %x before response.completed", marker)
+		}
 	}
 	unblock()
+	if backlog {
+		tail = second + third + tail
+	}
 	if tail != "" {
 		feed(nextTTS(tail), 72, []byte{0xf8, 0x56, 0x34, 0x12})
 	}
@@ -160,8 +214,29 @@ func testChatGPTProbe(t *testing.T, raw bool, tail string) {
 			t.Fatal("joined player did not close")
 		}
 	}
-	if closes != 1 || text.String() != first+tail || voice.String() != first+tail {
-		t.Fatalf("closes=%d text=%q voice=%q", closes, text.String(), voice.String())
+	if closes != 1 || open != 1 || last != 1 || text.String() != answer || voice.String() != answer {
+		t.Fatalf("opens=%d closes=%d last=%d text=%q voice=%q", open, closes, last, text.String(), voice.String())
+	}
+	var ends int
+	for len(audio) > 0 {
+		if len(audio) < 27 || string(audio[:4]) != "OggS" {
+			t.Fatal("invalid joined Ogg stream")
+		}
+		if audio[5]&4 != 0 {
+			ends++
+		}
+		n := int(audio[26])
+		size := 27 + n
+		for _, l := range audio[27:size] {
+			size += int(l)
+		}
+		if ends != 0 && size != len(audio) {
+			t.Fatal("audio after EOS")
+		}
+		audio = audio[size:]
+	}
+	if ends != 1 {
+		t.Fatalf("Ogg EOS pages=%d", ends)
 	}
 }
 

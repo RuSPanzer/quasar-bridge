@@ -196,6 +196,8 @@ func speechCloseFrame(id string, streamID uint32) ([]byte, error) {
 // Called under n.mu after the first synthesized segment closes. Keep the audio
 // alive through final TTS synthesis, until its TtsSpeak starts the next segment.
 func (n *Native) waitAudio(p *nativeRequest) {
+	p.audioGap++
+	gap := p.audioGap
 	n.wg.Go(func() {
 		ticker := time.NewTicker(100 * time.Millisecond)
 		defer ticker.Stop()
@@ -205,7 +207,7 @@ func (n *Native) waitAudio(p *nativeRequest) {
 				return
 			case <-ticker.C:
 				n.mu.Lock()
-				if p.canceled || !p.audioWaiting {
+				if p.canceled || !p.audioWaiting || p.audioGap != gap {
 					n.mu.Unlock()
 					return
 				}
