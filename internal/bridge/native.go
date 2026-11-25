@@ -53,7 +53,7 @@ type nativeRequest struct {
 	audioInputDone                  bool
 	inputWhisper                    bool
 	streaming                       bool
-	listenOnStreamStart             bool
+	listenScheduled                 bool // First envelope's ShouldListen; read after the progress pump joins.
 	partial                         uint32
 	responseID                      string
 	final                           bool
@@ -616,13 +616,10 @@ func (n *Native) maybeResolve(p *nativeRequest) {
 		if n.resolver != nil && strings.TrimSpace(text) != "" {
 			if routed, ok := n.resolver.(RoutedResolver); ok {
 				decision := routed.Decide(p.ctx, text)
-				n.mu.Lock()
-				p.listenOnStreamStart = decision.Source == "dialogue_retry"
-				n.mu.Unlock()
 				slog.Info("native_route_decision", "request", requestTag(p.id), "route", decision.Route, "source", decision.Source)
 				stop := func() {}
 				if decision.Route != "yandex" && n.ProgressAfter > 0 {
-					stop = n.progress(p)
+					stop = n.progress(p, decision.Route == "llm")
 				}
 				result, err = routed.ResolveDecision(p.ctx, text, decision)
 				stop()

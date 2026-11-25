@@ -14,6 +14,7 @@ import (
 	cancellation "github.com/skrashevich/quasar-go-genproto/proto/alice/protos/api/alicekit/events/cancel_request"
 	header "github.com/skrashevich/quasar-go-genproto/proto/alice/protos/api/alicekit/events/common/event_header"
 	client "github.com/skrashevich/quasar-go-genproto/proto/alice/protos/api/alicekit/protocol/client"
+	endpoint "github.com/skrashevich/quasar-go-genproto/proto/alice/protos/endpoint"
 	fileplayer "github.com/skrashevich/quasar-go-genproto/proto/alice/protos/endpoint/capabilities/audio_file_player"
 	"google.golang.org/protobuf/proto"
 
@@ -216,14 +217,11 @@ func (r soundProgressResolver) ResolveDecision(ctx context.Context, text string,
 func TestNativeSoundOnlyOnFinalDeferredResponse(t *testing.T) {
 	release := make(chan struct{})
 	n, up, down := soundSession(t, soundProgressResolver{resolverFunc(func(ctx context.Context, _ string) (Resolution, error) {
-		if err := sound.Play(ctx, sound.Request{URL: "https://audio.example/test.mp3"}); err != nil {
-			return Resolution{Route: "llm"}, err
-		}
 		select {
 		case <-ctx.Done():
 			return Resolution{}, ctx.Err()
 		case <-release:
-			return Resolution{Route: "llm", Answer: "Готово."}, nil
+			return Resolution{Route: "llm", Answer: "Готово."}, sound.Play(ctx, sound.Request{URL: "https://audio.example/test.mp3"})
 		}
 	})})
 	n.ProgressAfter = time.Millisecond
@@ -239,6 +237,9 @@ func TestNativeSoundOnlyOnFinalDeferredResponse(t *testing.T) {
 	}
 	for len(down) > 0 {
 		f := <-down
+		if r := f.Server.GetEvent().GetAliceResponse(); r != nil && !r.GetVoiceResponse().GetShouldListen() {
+			t.Fatal("no initial listening to revoke")
+		}
 		for _, d := range f.Server.GetEvent().GetAliceResponse().GetResponse().GetDirectives() {
 			if d.GetName() == "audio_play" {
 				t.Fatal("intermediate response played sound")
@@ -250,9 +251,18 @@ func TestNativeSoundOnlyOnFinalDeferredResponse(t *testing.T) {
 	}
 	close(release)
 	sawEOS, sawClose := false, false
+	revoked := 0
 	for {
 		f := nextSoundFrame(t, down)
+		for _, d := range f.Server.GetEvent().GetDeferredAliceResponse().GetBaseResponse().GetDirectives() {
+			if d.GetDirectiveType() == endpoint.TCapability_InvalidateAutoListenDirectiveType {
+				revoked++
+			}
+		}
 		if f.Kind() == "opaque" && len(f.Raw) > 31 && string(f.Raw[4:8]) == "OggS" && f.Raw[9]&4 != 0 {
+			if revoked != 1 {
+				t.Fatalf("late media: got %d revocations before audio ended, want 1", revoked)
+			}
 			page := f.Raw[4:]
 			if binary.BigEndian.Uint32(f.Raw[:4]) != 72 || oggChecksum(page) != binary.LittleEndian.Uint32(page[22:26]) || len(page) != 31 || string(page[28:]) != string([]byte{0xf8, 0xff, 0xfe}) {
 				t.Fatal("invalid final silent Opus packet")

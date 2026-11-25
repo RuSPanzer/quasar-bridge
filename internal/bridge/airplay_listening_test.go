@@ -15,6 +15,7 @@ import (
 	response "github.com/skrashevich/quasar-go-genproto/proto/alice/protos/api/alicekit/events/alice_response"
 	header "github.com/skrashevich/quasar-go-genproto/proto/alice/protos/api/alicekit/events/common/event_header"
 	client "github.com/skrashevich/quasar-go-genproto/proto/alice/protos/api/alicekit/protocol/client"
+	endpoint "github.com/skrashevich/quasar-go-genproto/proto/alice/protos/endpoint"
 	"google.golang.org/protobuf/encoding/protowire"
 )
 
@@ -146,7 +147,7 @@ func TestAirPlayStartSuppressesListeningOnlyForSuccessfulRequest(t *testing.T) {
 }
 
 func TestAirPlayStartDeferredResponseKeepsSpeechWithoutListening(t *testing.T) {
-	for _, mode := range []string{"native", "tool", "tool_model_error"} {
+	for _, mode := range []string{"native", "tool", "tool_model_error", "tool_starts_after_placeholder"} {
 		t.Run(mode, func(t *testing.T) {
 			release := make(chan struct{})
 			control := airPlayListeningController{}
@@ -155,6 +156,8 @@ func TestAirPlayStartDeferredResponseKeepsSpeechWithoutListening(t *testing.T) {
 			if mode == "native" {
 				control.wait = release
 				text = "включи airplay"
+			} else if mode == "tool_starts_after_placeholder" {
+				control.wait = release
 			} else {
 				chat.wait = release
 				if mode == "tool_model_error" {
@@ -169,8 +172,9 @@ func TestAirPlayStartDeferredResponseKeepsSpeechWithoutListening(t *testing.T) {
 				t.Fatal(err)
 			}
 			initial := airPlayListeningResponse(t, down)
-			if !initial.GetResponse().GetIsStreaming() || initial.GetVoiceResponse().GetShouldListen() {
-				t.Fatal("AirPlay streaming envelope reopened listening")
+			scheduled := initial.GetVoiceResponse().GetShouldListen()
+			if !initial.GetResponse().GetIsStreaming() || (mode == "native" && scheduled) || (mode == "tool_starts_after_placeholder" && !scheduled) {
+				t.Fatalf("unexpected initial AirPlay response: scheduled=%v", scheduled)
 			}
 			for {
 				f := nextSoundFrame(t, up)
@@ -197,13 +201,22 @@ func TestAirPlayStartDeferredResponseKeepsSpeechWithoutListening(t *testing.T) {
 				t.Fatal("AirPlay policy leaked to a concurrent request")
 			}
 			close(release)
+			revoked := 0
 			for {
 				part := nextSoundFrame(t, down).Server.GetEvent().GetDeferredAliceResponse()
+				for _, d := range part.GetBaseResponse().GetDirectives() {
+					if d.GetDirectiveType() == endpoint.TCapability_InvalidateAutoListenDirectiveType {
+						revoked++
+					}
+				}
 				if part == nil || !part.GetIsLast() {
 					continue
 				}
 				if part.GetBaseResponse().GetShouldListen() || part.GetBaseResponse().GetText() == "" {
 					t.Fatal("AirPlay final response reopened listening or lost confirmation")
+				}
+				if (scheduled && revoked != 1) || (!scheduled && revoked != 0) {
+					t.Fatalf("scheduled=%v, got %d revocations before final speech", scheduled, revoked)
 				}
 				unknown := part.GetBaseResponse().ProtoReflect().GetUnknown()
 				num, typ, count := protowire.ConsumeTag(unknown)

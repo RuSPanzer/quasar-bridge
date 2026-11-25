@@ -14,12 +14,13 @@ import (
 	stream "github.com/skrashevich/quasar-go-genproto/proto/alice/protos/api/alicekit/events/stream_control"
 	server "github.com/skrashevich/quasar-go-genproto/proto/alice/protos/api/alicekit/protocol/server"
 	deferred "github.com/skrashevich/quasar-go-genproto/proto/alice/protos/api/alicekit/streaming"
+	endpoint "github.com/skrashevich/quasar-go-genproto/proto/alice/protos/endpoint"
 	"google.golang.org/protobuf/encoding/protowire"
 )
 
 // progress starts only after the executor is known. Stop joins the pump so no
 // partial can race with the final answer or continue after cancellation.
-func (n *Native) progress(p *nativeRequest) func() {
+func (n *Native) progress(p *nativeRequest, listenOnStreamStart bool) func() {
 	stop := make(chan struct{})
 	done := make(chan struct{})
 	n.wg.Go(func() {
@@ -57,7 +58,7 @@ func (n *Native) progress(p *nativeRequest) func() {
 				return
 			}
 		}
-		if n.beginDeferred(p) != nil {
+		if n.beginDeferred(p, listenOnStreamStart) != nil {
 			p.cancel()
 			return
 		}
@@ -90,11 +91,10 @@ func (p *nativeRequest) applicationID() string {
 	}
 	return p.id
 }
-func (n *Native) beginDeferred(p *nativeRequest) error {
+func (n *Native) beginDeferred(p *nativeRequest, listenOnStreamStart bool) error {
 	r := &response.TAliceResponseProto{Header: &response.TAliceResponseProto_THeader{RequestId: new(p.applicationID()), ResponseId: new(p.responseID), DialogId: new(p.request.GetHeader().GetDialogId()), SequenceNumber: new(p.request.GetHeader().GetSequenceNumber())}, VoiceResponse: &response.TAliceResponseProto_TVoiceResponse{HasVoiceResponse: true, OutputSpeech: &response.TAliceResponseProto_TVoiceResponse_TOutputSpeech{Text: new("")}}, Response: &response.TAliceResponseProto_TResponse{IsStreaming: true, Directives: []*directive.TDirective{{Type: "client_action", Name: "tts_play_placeholder"}}}}
 	// Station schedules post-speech listening from the initial stream envelope.
-	// Only retry is guaranteed informational; other routes may start silent media.
-	r.VoiceResponse.ShouldListen = n.ShouldListen && p.listenOnStreamStart && reply.ListeningAllowed(p.ctx)
+	r.VoiceResponse.ShouldListen = n.ShouldListen && listenOnStreamStart && !n.hasSilentPlayback(p) && reply.ListeningAllowed(p.ctx)
 	m := &server.TServerMessage{Message: &server.TServerMessage_Event{Event: &server.TServerMessage_TEvent{Header: &header.TEventHeader{MessageId: newID(), RefMessageId: p.id}, Event: &server.TServerMessage_TEvent_AliceResponse{AliceResponse: r}}}}
 	b, err := (wire.Frame{Server: m, Prefix: []byte("AAPI")}).Marshal()
 	if err != nil {
@@ -103,25 +103,26 @@ func (n *Native) beginDeferred(p *nativeRequest) error {
 	if err := n.down(p.ctx, websocket.MessageBinary, b); err != nil {
 		return err
 	}
+	p.listenScheduled = r.VoiceResponse.ShouldListen
 	if err := n.deferredPart(p, "", "", false); err != nil {
 		return err
 	}
 	// Obtain the provider's actual Opus headers; its speech payload is discarded.
 	return n.synthesize(p, "а")
 }
-func (n *Native) deferredPart(p *nativeRequest, text, voice string, last bool) error {
+func (n *Native) deferredPart(p *nativeRequest, text, voice string, last bool, controls ...*directive.TDirective) error {
 	if err := p.ctx.Err(); err != nil {
 		return err
 	}
 	p.partial++
-	base := &deferred.TDeferedAliceResponseProto_TBaseResponse{}
+	base := &deferred.TDeferedAliceResponseProto_TBaseResponse{Directives: controls}
 	if last {
 		silentPlayback := n.hasSilentPlayback(p)
 		base.ShouldListen = n.ShouldListen && !silentPlayback && reply.ListeningAllowed(p.ctx)
 		if silentPlayback {
 			voice = ""
 		}
-		base.Directives = n.takeSound(p)
+		base.Directives = append(base.Directives, n.takeSound(p)...)
 	}
 	if text != "" {
 		base.Text = new(text)
@@ -149,7 +150,18 @@ func (n *Native) finishDeferred(p *nativeRequest, text, voice, speech string) er
 		return p.ctx.Err()
 	case <-p.progressAudioDone:
 	}
-	if n.hasSilentPlayback(p) {
+	silentPlayback := n.hasSilentPlayback(p)
+	if p.listenScheduled && (silentPlayback || !reply.ListeningAllowed(p.ctx)) {
+		// Clearing the final flag cannot retract the initial listen. Revoke it
+		// while the Dialog player is still open, before Close or the final TTS.
+		cancelListen := &directive.TDirective{Type: "client_action", Name: "invalidate_auto_listen_directive",
+			DirectiveType: endpoint.TCapability_InvalidateAutoListenDirectiveType, IsParallel: true,
+			PayloadType: &directive.TDirective_PayloadRaw{PayloadRaw: []byte{}}}
+		if err := n.deferredPart(p, "", "", false, cancelListen); err != nil {
+			return err
+		}
+	}
+	if silentPlayback {
 		if err := n.finishSilentAudio(p); err != nil {
 			return err
 		}

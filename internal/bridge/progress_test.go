@@ -9,6 +9,8 @@ import (
 	"time"
 
 	"github.com/coder/websocket"
+	"github.com/skrashevich/quasar-bridge/internal/assistant"
+	"github.com/skrashevich/quasar-bridge/internal/llm"
 	"github.com/skrashevich/quasar-bridge/internal/wire"
 	common "github.com/skrashevich/quasar-go-genproto/proto/alice/megamind/protos/common"
 	request "github.com/skrashevich/quasar-go-genproto/proto/alice/protos/api/alicekit/events/alice_request"
@@ -20,21 +22,18 @@ import (
 	"google.golang.org/protobuf/encoding/protowire"
 )
 
-type delayedRoute struct{ release <-chan struct{} }
-
-func (d delayedRoute) Decide(context.Context, string) RouteDecision {
-	return RouteDecision{Route: "llm"}
-}
-func (d delayedRoute) Resolve(ctx context.Context, s string) (Resolution, error) {
-	return d.ResolveDecision(ctx, s, d.Decide(ctx, s))
-}
-func (d delayedRoute) ResolveDecision(ctx context.Context, s string, r RouteDecision) (Resolution, error) {
-	select {
-	case <-ctx.Done():
-		return Resolution{}, ctx.Err()
-	case <-d.release:
-		return Resolution{Route: "llm", Answer: "Готовый ответ"}, nil
-	}
+func delayedLLM(release <-chan struct{}) *Engine {
+	return &Engine{LLM: completionFunc(func(ctx context.Context, _ []llm.Message, structured bool) (string, error) {
+		if structured {
+			return `{"route":"llm"}`, nil
+		}
+		select {
+		case <-ctx.Done():
+			return "", ctx.Err()
+		case <-release:
+			return "Готовый ответ", nil
+		}
+	})}
 }
 func TestSlowLocalRequestUsesDeferredResponses(t *testing.T) {
 	for _, finalStream := range []uint32{72, 88} {
@@ -46,6 +45,62 @@ func TestSlowLocalRequestUsesDeferredResponses(t *testing.T) {
 	}
 	t.Run("listening_disabled", func(t *testing.T) { testSlowLocalRequest(t, 72, false, true, false) })
 }
+
+type heldSpokenAnswer struct{ release <-chan struct{} }
+
+func (c heldSpokenAnswer) Chat(ctx context.Context, _ []llm.Message, _ []llm.Tool) (llm.Message, error) {
+	select {
+	case <-ctx.Done():
+		return llm.Message{}, ctx.Err()
+	case <-c.release:
+		return llm.Message{Role: "assistant", Content: "Готовый ответ."}, nil
+	}
+}
+
+func TestDeferredSpokenAnswerListensWithToolsAvailable(t *testing.T) {
+	for _, tc := range []struct {
+		name  string
+		tools *assistant.Tools
+	}{
+		{"read_only", &assistant.Tools{Config: assistant.Config{Web: true, Time: true, Timezone: "UTC"}}},
+		{"speaker_tools", &assistant.Tools{Config: assistant.Config{Configuration: true, PlaySound: true}, Configuration: struct{ assistant.BridgeConfiguration }{}, AirPlay: airPlayListeningController{}}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			// Hold the model until the first envelope, before it has chosen a tool.
+			release := make(chan struct{})
+			engine := &Engine{Assistant: &assistant.Agent{Client: heldSpokenAnswer{release}, Tools: tc.tools, MaxRounds: 1, MaxCalls: 1}}
+			n, up, down := soundSession(t, engine)
+			n.ProgressAfter = time.Millisecond
+			if err := n.Client(t.Context(), websocket.MessageBinary, airPlayListeningInput("tool-policy", "Напиши код сортировки на Go")); err != nil {
+				t.Fatal(err)
+			}
+			r := airPlayListeningResponse(t, down)
+			if !r.GetResponse().GetIsStreaming() || !r.GetVoiceResponse().GetShouldListen() {
+				t.Fatal("ordinary speech did not schedule listening at stream start")
+			}
+			for {
+				if ev := nextSoundFrame(t, up).Client.GetEvent(); ev.GetTtsGenerate() != nil {
+					feedSpeech(t, n, ev.GetHeader().GetMessageId(), 72, false)
+					break
+				}
+			}
+			close(release)
+			for {
+				part := nextSoundFrame(t, down).Server.GetEvent().GetDeferredAliceResponse()
+				if len(part.GetBaseResponse().GetDirectives()) > 0 {
+					t.Fatal("ordinary spoken answer emitted an action")
+				}
+				if part.GetIsLast() {
+					if !part.GetBaseResponse().GetShouldListen() || part.GetBaseResponse().GetText() != "Готовый ответ." {
+						t.Fatal("final speech or listening lost")
+					}
+					break
+				}
+			}
+		})
+	}
+}
+
 func testSlowLocalRequest(t *testing.T, finalStream uint32, omitID, voice, shouldListen bool) {
 	release := make(chan struct{})
 	down := make(chan wire.Frame, 20)
@@ -56,7 +111,7 @@ func testSlowLocalRequest(t *testing.T, finalStream uint32, omitID, voice, shoul
 	}, func(ctx context.Context, k websocket.MessageType, b []byte) error {
 		down <- wire.Decode(b, wire.ServerToClient)
 		return nil
-	}, delayedRoute{release})
+	}, delayedLLM(release))
 	defer n.Close()
 	n.ShouldListen = shouldListen
 	n.ProgressAfter = 5 * time.Millisecond
@@ -87,8 +142,8 @@ func testSlowLocalRequest(t *testing.T, finalStream uint32, omitID, voice, shoul
 	if initial.Kind() != "AliceResponse" || !initial.Server.GetEvent().GetAliceResponse().GetResponse().GetIsStreaming() {
 		t.Fatal("missing initial streaming response")
 	}
-	if initial.Server.GetEvent().GetAliceResponse().GetVoiceResponse().GetShouldListen() {
-		t.Fatal("initial streaming response reopened listening")
+	if got := initial.Server.GetEvent().GetAliceResponse().GetVoiceResponse().GetShouldListen(); got != shouldListen {
+		t.Fatalf("initial answer should_listen=%v, want %v", got, shouldListen)
 	}
 	part := next().Server.GetEvent().GetDeferredAliceResponse()
 	if part == nil || part.GetIsLast() || part.GetRequestId() != "application-request" || part.GetBaseResponse().GetText() != "" {
@@ -218,7 +273,7 @@ func TestProgressCancellationStopsWithoutFinalAnswer(t *testing.T) {
 	n := NewNative(t.Context(), func(context.Context, websocket.MessageType, []byte) error { return nil }, func(_ context.Context, _ websocket.MessageType, b []byte) error {
 		down <- wire.Decode(b, wire.ServerToClient)
 		return nil
-	}, delayedRoute{release})
+	}, delayedLLM(release))
 	n.ProgressAfter = time.Millisecond
 	n.ProgressInterval = time.Millisecond
 	input := &client.TClientMessage{Message: &client.TClientMessage_Event{Event: &client.TClientMessage_TEvent{Header: &header.TEventHeader{MessageId: "cancel-test"}, Event: &client.TClientMessage_TEvent_TextInput{TextInput: &request.TAliceRequestProto{Request: &request.TAliceRequestProto_TRequest{Event: &common.TEvent{Text: new("история")}}}}}}}
