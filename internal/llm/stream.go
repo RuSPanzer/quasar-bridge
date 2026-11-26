@@ -2,6 +2,7 @@ package llm
 
 import (
 	"bufio"
+	"context"
 	"encoding/json/jsontext"
 	"encoding/json/v2"
 	"errors"
@@ -13,15 +14,28 @@ import (
 
 const maxStreamBytes = 2 << 20
 
+type textPreviewKey struct{}
+
+// WithTextPreview observes final-answer text on a subscription voice turn.
+// Completion, history and errors still use the validated terminal event.
+func WithTextPreview(ctx context.Context, emit func(string) error) context.Context {
+	return context.WithValue(ctx, textPreviewKey{}, emit)
+}
+
 // readResponseStream releases output only after the terminal response. Some
 // providers omit its output array, so retain completed items, never deltas.
 func readResponseStream(body io.Reader) ([]byte, error) {
+	return readResponseStreamPreview(body, nil, false)
+}
+
+func readResponseStreamPreview(body io.Reader, emit func(string) error, toolsEnabled bool) ([]byte, error) {
 	limited := &io.LimitedReader{R: body, N: maxStreamBytes + 1}
 	scanner := bufio.NewScanner(limited)
 	scanner.Buffer(make([]byte, 4096), maxStreamBytes+1)
 	var data strings.Builder
 	items := make(map[int]jsontext.Value)
 	first := true
+	previewID, previewIndex := "", -1
 	consume := func() ([]byte, error) {
 		if data.Len() == 0 {
 			return nil, nil
@@ -41,6 +55,32 @@ func readResponseStream(body io.Reader) ([]byte, error) {
 			return nil, errors.New("invalid LLM response stream")
 		}
 		switch event.Type {
+		case "response.output_item.added":
+			if emit != nil && previewID == "" && event.OutputIndex != nil {
+				var item struct {
+					ID    string `json:"id"`
+					Type  string `json:"type"`
+					Role  string `json:"role"`
+					Phase string `json:"phase"`
+				}
+				// An unlabelled message may be a preamble to a tool call.
+				if json.Unmarshal(event.Item, &item) == nil && item.Type == "message" && item.Role == "assistant" && (item.Phase == "final_answer" || (!toolsEnabled && item.Phase == "")) {
+					previewID, previewIndex = item.ID, *event.OutputIndex
+				}
+			}
+			return nil, nil
+		case "response.output_text.delta":
+			if emit != nil && previewID != "" && event.OutputIndex != nil && *event.OutputIndex == previewIndex {
+				var d struct {
+					ItemID       string `json:"item_id"`
+					ContentIndex *int   `json:"content_index"`
+					Delta        string `json:"delta"`
+				}
+				if json.Unmarshal([]byte(payload), &d) == nil && d.ItemID == previewID && d.ContentIndex != nil && *d.ContentIndex == 0 {
+					return nil, emit(d.Delta)
+				}
+			}
+			return nil, nil
 		case "response.output_item.done":
 			var item struct {
 				Type string `json:"type"`

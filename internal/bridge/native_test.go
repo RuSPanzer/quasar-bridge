@@ -402,6 +402,10 @@ func TestNativeApprovalHoldsExecutionUntilDecision(t *testing.T) {
 
 type fallbackResolver struct{}
 
+func cloudRefusal(id string) []byte {
+	return aa(&server.TServerMessage{Message: &server.TServerMessage_Event{Event: &server.TServerMessage_TEvent{Header: &header.TEventHeader{RefMessageId: id}, Event: &server.TServerMessage_TEvent_AliceResponse{AliceResponse: &response.TAliceResponseProto{Response: &response.TAliceResponseProto_TResponse{Directives: []*directives.TDirective{{Type: "client_action", Name: "tts_play_placeholder"}}}, VoiceResponse: &response.TAliceResponseProto_TVoiceResponse{OutputSpeech: &response.TAliceResponseProto_TVoiceResponse_TOutputSpeech{Text: new("Я не могу ответить на этот вопрос.")}}}}}}})
+}
+
 func (fallbackResolver) Resolve(context.Context, string) (Resolution, error) {
 	return Resolution{Route: "yandex"}, nil
 }
@@ -425,7 +429,7 @@ func TestNativeRefusalUsesLLMAndSuppressesOldCloudAudio(t *testing.T) {
 	case <-ctx.Done():
 		t.Fatal("no cloud input")
 	}
-	refusal := aa(&server.TServerMessage{Message: &server.TServerMessage_Event{Event: &server.TServerMessage_TEvent{Header: &header.TEventHeader{RefMessageId: "refusal"}, Event: &server.TServerMessage_TEvent_AliceResponse{AliceResponse: &response.TAliceResponseProto{Response: &response.TAliceResponseProto_TResponse{Directives: []*directives.TDirective{{Type: "client_action", Name: "tts_play_placeholder"}}}, VoiceResponse: &response.TAliceResponseProto_TVoiceResponse{OutputSpeech: &response.TAliceResponseProto_TVoiceResponse_TOutputSpeech{Text: new("Я не могу ответить на этот вопрос.")}}}}}}})
+	refusal := cloudRefusal("refusal")
 	if err := n.Server(ctx, websocket.MessageBinary, refusal); err != nil {
 		t.Fatal(err)
 	}

@@ -205,9 +205,15 @@ func TestNativeSoundDroppedOnResolutionFailureOrCancellation(t *testing.T) {
 	}
 }
 
-type soundProgressResolver struct{ resolverFunc }
+type soundProgressResolver struct {
+	resolverFunc
+	beforeProgress func(context.Context)
+}
 
-func (soundProgressResolver) Decide(context.Context, string) RouteDecision {
+func (r soundProgressResolver) Decide(ctx context.Context, _ string) RouteDecision {
+	if r.beforeProgress != nil {
+		r.beforeProgress(ctx)
+	}
 	return RouteDecision{Route: "llm"}
 }
 func (r soundProgressResolver) ResolveDecision(ctx context.Context, text string, _ RouteDecision) (Resolution, error) {
@@ -215,15 +221,61 @@ func (r soundProgressResolver) ResolveDecision(ctx context.Context, text string,
 }
 
 func TestNativeSoundOnlyOnFinalDeferredResponse(t *testing.T) {
+	t.Run("queued_before_placeholder", func(t *testing.T) { testDeferredMedia(t, true, "") })
+	t.Run("queued_after_placeholder", func(t *testing.T) { testDeferredMedia(t, false, "") })
+	for _, frame := range []string{"revocation", "EOS"} {
+		t.Run("cancel_at_"+frame, func(t *testing.T) { testDeferredMedia(t, false, frame) })
+	}
+}
+
+func testDeferredMedia(t *testing.T, early bool, cancelAt string) {
 	release := make(chan struct{})
-	n, up, down := soundSession(t, soundProgressResolver{resolverFunc(func(ctx context.Context, _ string) (Resolution, error) {
+	play := func(ctx context.Context) error {
+		return sound.Play(ctx, sound.Request{URL: "https://audio.example/test.mp3"})
+	}
+	resolver := soundProgressResolver{resolverFunc: func(ctx context.Context, _ string) (Resolution, error) {
 		select {
 		case <-ctx.Done():
 			return Resolution{}, ctx.Err()
 		case <-release:
-			return Resolution{Route: "llm", Answer: "Готово."}, sound.Play(ctx, sound.Request{URL: "https://audio.example/test.mp3"})
+			var err error
+			if !early {
+				err = play(ctx)
+			}
+			return Resolution{Route: "llm", Answer: "Готово."}, err
 		}
-	})})
+	}}
+	if early {
+		// Queue before the timer is even started, independently of scheduling.
+		resolver.beforeProgress = func(ctx context.Context) {
+			if err := play(ctx); err != nil {
+				t.Error(err)
+			}
+		}
+	}
+	n, up, down := soundSession(t, resolver)
+	canceled := make(chan struct{})
+	if cancelAt != "" {
+		send := n.down
+		n.down = func(ctx context.Context, k websocket.MessageType, b []byte) error {
+			f := wire.Decode(b, wire.ServerToClient)
+			if ctx.Err() != nil {
+				t.Errorf("wrote %s after CancelRequest at %s", f.Kind(), cancelAt)
+			}
+			if err := send(ctx, k, b); err != nil {
+				return err
+			}
+			ds := f.Server.GetEvent().GetDeferredAliceResponse().GetBaseResponse().GetDirectives()
+			revoke := len(ds) == 1 && ds[0].GetDirectiveType() == endpoint.TCapability_InvalidateAutoListenDirectiveType
+			eos := f.Kind() == "opaque" && len(b) > 9 && b[9]&4 != 0
+			if (cancelAt == "revocation" && revoke) || (cancelAt == "EOS" && eos) {
+				err := n.Client(t.Context(), websocket.MessageBinary, cloudGateCancel("deferred-sound"))
+				close(canceled)
+				return err
+			}
+			return nil
+		}
+	}
 	n.ProgressAfter = time.Millisecond
 	if err := n.Client(t.Context(), websocket.MessageBinary, soundInput("deferred-sound")); err != nil {
 		t.Fatal(err)
@@ -237,8 +289,8 @@ func TestNativeSoundOnlyOnFinalDeferredResponse(t *testing.T) {
 	}
 	for len(down) > 0 {
 		f := <-down
-		if r := f.Server.GetEvent().GetAliceResponse(); r != nil && !r.GetVoiceResponse().GetShouldListen() {
-			t.Fatal("no initial listening to revoke")
+		if r := f.Server.GetEvent().GetAliceResponse(); r != nil && r.GetVoiceResponse().GetShouldListen() == early {
+			t.Fatalf("initial ShouldListen=%v, media queued early=%v", r.GetVoiceResponse().GetShouldListen(), early)
 		}
 		for _, d := range f.Server.GetEvent().GetAliceResponse().GetResponse().GetDirectives() {
 			if d.GetName() == "audio_play" {
@@ -250,6 +302,15 @@ func TestNativeSoundOnlyOnFinalDeferredResponse(t *testing.T) {
 		}
 	}
 	close(release)
+	if cancelAt != "" {
+		select {
+		case <-canceled:
+		case <-time.After(time.Second):
+			t.Fatalf("did not reach %s", cancelAt)
+		}
+		n.wg.Wait()
+		return
+	}
 	sawEOS, sawClose := false, false
 	revoked := 0
 	for {
@@ -260,8 +321,8 @@ func TestNativeSoundOnlyOnFinalDeferredResponse(t *testing.T) {
 			}
 		}
 		if f.Kind() == "opaque" && len(f.Raw) > 31 && string(f.Raw[4:8]) == "OggS" && f.Raw[9]&4 != 0 {
-			if revoked != 1 {
-				t.Fatalf("late media: got %d revocations before audio ended, want 1", revoked)
+			if revoked > 1 || (revoked == 1) == early {
+				t.Fatalf("media queued early=%v: got %d revocations before audio ended", early, revoked)
 			}
 			page := f.Raw[4:]
 			if binary.BigEndian.Uint32(f.Raw[:4]) != 72 || oggChecksum(page) != binary.LittleEndian.Uint32(page[22:26]) || len(page) != 31 || string(page[28:]) != string([]byte{0xf8, 0xff, 0xfe}) {

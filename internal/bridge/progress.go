@@ -104,8 +104,11 @@ func (n *Native) beginDeferred(p *nativeRequest, listenOnStreamStart bool) error
 		return err
 	}
 	p.listenScheduled = r.VoiceResponse.ShouldListen
-	if err := n.deferredPart(p, "", "", false); err != nil {
+	if err := n.deferredPart(p, p.firstPhrase, p.firstPhrase, false); err != nil {
 		return err
+	}
+	if p.firstPhrase != "" {
+		return n.synthesize(p, p.firstPhrase)
 	}
 	// Obtain the provider's actual Opus headers; its speech payload is discarded.
 	return n.synthesize(p, "а")
@@ -144,28 +147,42 @@ func (n *Native) deferredPart(p *nativeRequest, text, voice string, last bool, c
 	n.captureDelivered(p, text, last, len(base.Directives) > 0, true)
 	return nil
 }
+
+// Clearing the final flag does not undo the first envelope. Revoke while
+// the Dialog player is still open; keep the actual media directive for last.
+func (n *Native) revokeDeferredListenIfNeeded(p *nativeRequest) error {
+	if !p.listenScheduled || (!n.hasSilentPlayback(p) && reply.ListeningAllowed(p.ctx)) {
+		return nil
+	}
+	revoke := &directive.TDirective{Type: "client_action", Name: "invalidate_auto_listen_directive",
+		DirectiveType: endpoint.TCapability_InvalidateAutoListenDirectiveType, IsParallel: true,
+		PayloadType: &directive.TDirective_PayloadRaw{PayloadRaw: []byte{}}}
+	if err := n.deferredPart(p, "", "", false, revoke); err != nil {
+		return err
+	}
+	p.listenScheduled = false
+	return nil
+}
+
 func (n *Native) finishDeferred(p *nativeRequest, text, voice, speech string) error {
 	select {
 	case <-p.ctx.Done():
 		return p.ctx.Err()
 	case <-p.progressAudioDone:
 	}
-	silentPlayback := n.hasSilentPlayback(p)
-	if p.listenScheduled && (silentPlayback || !reply.ListeningAllowed(p.ctx)) {
-		// Clearing the final flag cannot retract the initial listen. Revoke it
-		// while the Dialog player is still open, before Close or the final TTS.
-		cancelListen := &directive.TDirective{Type: "client_action", Name: "invalidate_auto_listen_directive",
-			DirectiveType: endpoint.TCapability_InvalidateAutoListenDirectiveType, IsParallel: true,
-			PayloadType: &directive.TDirective_PayloadRaw{PayloadRaw: []byte{}}}
-		if err := n.deferredPart(p, "", "", false, cancelListen); err != nil {
-			return err
-		}
+	if err := n.revokeDeferredListenIfNeeded(p); err != nil {
+		return err
 	}
-	if silentPlayback {
+	if n.hasSilentPlayback(p) {
 		if err := n.finishSilentAudio(p); err != nil {
 			return err
 		}
-		return n.deferredPart(p, text, voice, true)
+		if err := n.deferredPart(p, text, voice, true); err != nil {
+			return err
+		}
+		// No final TTS Close will signal delivery for this media-only handoff.
+		reply.Delivered(p.ctx)
+		return nil
 	}
 	n.mu.Lock()
 	p.ttsID = newID()
@@ -184,20 +201,32 @@ func (n *Native) finishSilentAudio(p *nativeRequest) error {
 	end := p.audio.finishSilence()
 	streamID := p.audioStream
 	n.mu.Unlock()
+	if err := p.ctx.Err(); err != nil {
+		return err
+	}
 	if err := n.down(p.ctx, websocket.MessageBinary, append(binary.BigEndian.AppendUint32(nil, streamID), end...)); err != nil {
 		return err
 	}
-	m := &server.TServerMessage{Message: &server.TServerMessage_StreamControl{StreamControl: &stream.TStreamControl{MessageId: p.id, StreamId: int64(streamID), Action: &stream.TStreamControl_Close{Close: &stream.TStreamControl_TActionClose{}}}}}
-	b, err := (wire.Frame{Server: m, Prefix: []byte("AAPI")}).Marshal()
+	b, err := speechCloseFrame(p.id, streamID)
 	if err != nil {
+		return err
+	}
+	if err := p.ctx.Err(); err != nil {
 		return err
 	}
 	return n.down(p.ctx, websocket.MessageBinary, b)
 }
 
+func speechCloseFrame(id string, streamID uint32) ([]byte, error) {
+	m := &server.TServerMessage{Message: &server.TServerMessage_StreamControl{StreamControl: &stream.TStreamControl{MessageId: id, StreamId: int64(streamID), Action: &stream.TStreamControl_Close{Close: &stream.TStreamControl_TActionClose{}}}}}
+	return (wire.Frame{Server: m, Prefix: []byte("AAPI")}).Marshal()
+}
+
 // Called under n.mu after the first synthesized segment closes. Keep the audio
 // alive through final TTS synthesis, until its TtsSpeak starts the next segment.
 func (n *Native) waitAudio(p *nativeRequest) {
+	p.audioGap++
+	gap := p.audioGap
 	n.wg.Go(func() {
 		ticker := time.NewTicker(100 * time.Millisecond)
 		defer ticker.Stop()
@@ -207,7 +236,7 @@ func (n *Native) waitAudio(p *nativeRequest) {
 				return
 			case <-ticker.C:
 				n.mu.Lock()
-				if p.canceled || !p.audioWaiting {
+				if p.canceled || !p.audioWaiting || p.audioGap != gap {
 					n.mu.Unlock()
 					return
 				}
